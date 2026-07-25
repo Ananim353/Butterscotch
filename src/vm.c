@@ -124,6 +124,20 @@ static uint8_t instrType2(uint32_t instr) {
     return (instr >> 20) & 0xF;
 }
 
+// The result of a numeric binary op (add/sub/mul/div/mod/rem and bitwise) is declared on the
+// stack with the WIDER of the two operand types. gmlStackType feeds the byte-count model in
+// bytesToSlotCount (used by the Dup swap variant and BC17 BREAK sub-opcodes), so it must match
+// the width the compiler assigned. Tagging with instrType2 alone under-sizes the result when
+// type1 is wider than type2 (e.g. add.v.i: Variable + int -> the result is a Variable-width
+// 16B slot, not an int 4B). When such a result feeds a `.v` Dup-swap over a method-call arg
+// list with no intervening Conv, the under-sized tag makes bytesToSlotCount overshoot a slot
+// boundary and abort at `require(remaining == 0)`.
+static uint8_t binaryResultType(uint32_t instr) {
+    uint8_t t1 = instrType1(instr);
+    uint8_t t2 = instrType2(instr);
+    return (gmlTypeNativeSize(t1) > gmlTypeNativeSize(t2)) ? t1 : t2;
+}
+
 static int16_t instrInstanceType(uint32_t instr) {
     return (int16_t) (instr & 0xFFFF);
 }
@@ -1547,7 +1561,7 @@ static void handleDiv(VMContext* ctx, uint32_t instr) {
     GMLReal result = RValue_toReal(a) / divisor;
     RValue_free(&a);
     RValue_free(&b);
-    stackPushTyped(ctx, RValue_makeReal(result), instrType2(instr));
+    stackPushTyped(ctx, RValue_makeReal(result), binaryResultType(instr));
 }
 
 static void handleRem(VMContext* ctx, uint32_t instr) {
@@ -1558,7 +1572,7 @@ static void handleRem(VMContext* ctx, uint32_t instr) {
     int64_t result = RValue_toInt64(a) / divisor;
     RValue_free(&a);
     RValue_free(&b);
-    stackPushTyped(ctx, RValue_makeInt64(result), instrType2(instr));
+    stackPushTyped(ctx, RValue_makeInt64(result), binaryResultType(instr));
 }
 
 static void handleMod(VMContext* ctx, uint32_t instr) {
@@ -1569,14 +1583,14 @@ static void handleMod(VMContext* ctx, uint32_t instr) {
     GMLReal result = GMLReal_fmod(RValue_toReal(a), divisor);
     RValue_free(&a);
     RValue_free(&b);
-    stackPushTyped(ctx, RValue_makeReal(result), instrType2(instr));
+    stackPushTyped(ctx, RValue_makeReal(result), binaryResultType(instr));
 }
 
 #define SIMPLE_BYTECODE_BITWISE_OPERATION(op) \
     int32_t b = stackPopInt32(ctx); \
     int32_t a = stackPopInt32(ctx); \
     int32_t result = a op b; \
-    stackPushTyped(ctx, RValue_makeInt32(result), instrType2(instr))
+    stackPushTyped(ctx, RValue_makeInt32(result), binaryResultType(instr))
 
 static void handleAnd(VMContext* ctx, uint32_t instr) {
     SIMPLE_BYTECODE_BITWISE_OPERATION(&);
@@ -3037,10 +3051,10 @@ static RValue executeLoop(VMContext* ctx) {
                         slotA->real = aVal + bVal;
                         slotA->type = RVALUE_REAL;
                     }
-                    slotA->gmlStackType = instrType2(instr);
+                    slotA->gmlStackType = binaryResultType(instr);
                     ctx->stack.top--;
                 } else {
-                    uint8_t resultType = instrType2(instr);
+                    uint8_t resultType = binaryResultType(instr);
                     RValue b = stackPop(ctx);
                     RValue a = stackPop(ctx);
                     if (a.type == RVALUE_STRING || b.type == RVALUE_STRING) {
@@ -3074,10 +3088,10 @@ static RValue executeLoop(VMContext* ctx) {
                         slotA->real = aVal - bVal;
                         slotA->type = RVALUE_REAL;
                     }
-                    slotA->gmlStackType = instrType2(instr);
+                    slotA->gmlStackType = binaryResultType(instr);
                     ctx->stack.top--;
                 } else {
-                    uint8_t resultType = instrType2(instr);
+                    uint8_t resultType = binaryResultType(instr);
                     RValue b = stackPop(ctx);
                     RValue a = stackPop(ctx);
 #ifndef NO_RVALUE_INT64
@@ -3107,10 +3121,10 @@ static RValue executeLoop(VMContext* ctx) {
                         slotA->real = aVal * bVal;
                         slotA->type = RVALUE_REAL;
                     }
-                    slotA->gmlStackType = instrType2(instr);
+                    slotA->gmlStackType = binaryResultType(instr);
                     ctx->stack.top--;
                 } else {
-                    uint8_t resultType = instrType2(instr);
+                    uint8_t resultType = binaryResultType(instr);
                     RValue b = stackPop(ctx);
                     RValue a = stackPop(ctx);
                     if (a.type == RVALUE_STRING) {

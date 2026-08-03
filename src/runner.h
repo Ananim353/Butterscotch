@@ -8,6 +8,7 @@
 #include "file_system.h"
 #include "ini.h"
 #include "instance.h"
+#include "particles.h"
 #include "renderer.h"
 #include "runner_keyboard.h"
 #include "spatial_grid.h"
@@ -256,7 +257,7 @@ typedef struct {
 
 // A single entry in the depth-sorted draw list. Cached on Runner and rebuilt lazily based on Runner.drawableListStructureDirty / drawableListSortDirty.
 // Filtering on instance->active/visible and runtimeLayer->visible happens at draw time so toggling those does not require invalidating the cache.
-typedef enum { DRAWABLE_TILE, DRAWABLE_INSTANCE, DRAWABLE_LAYER } DrawableType;
+typedef enum { DRAWABLE_TILE, DRAWABLE_INSTANCE, DRAWABLE_LAYER, DRAWABLE_PARTICLE_SYSTEM } DrawableType;
 
 typedef struct {
     DrawableType type;
@@ -266,6 +267,8 @@ typedef struct {
         int32_t tileIndex;
         // Stored as an ID (resolved via Runner_findRuntimeLayerById) instead of a pointer, because layer_create can call arrput on runner->runtimeLayers mid-draw and realloc the array, invalidating any cached pointers.
         int32_t runtimeLayerId;
+        // Same reasoning as runtimeLayerId: part_system_create during a draw event can realloc the pool.
+        int32_t particleSystemId;
     };
 } Drawable;
 
@@ -550,6 +553,10 @@ struct Runner {
     DsGrid* dsGridPool; // stb_ds array of DsGrid
     GmlBuffer* gmlBufferPool; // stb_ds array of GmlBuffer
     MpGrid* mpGridPool; // stb_ds array of motion-planning grids
+    // Particle systems own their emitters and live particles; types are global and can be streamed by
+    // any system's emitters. Both pools reuse destroyed slots, matching the ds_* id behaviour.
+    ParticleSystem* particleSystemPool; // stb_ds array of ParticleSystem
+    ParticleType* particleTypePool; // stb_ds array of ParticleType
 
     // Motion planning potential field settings
     GMLReal mpPotMaxrot;

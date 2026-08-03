@@ -16499,6 +16499,177 @@ static RValue builtin_sprite_get_info(VMContext* ctx, RValue* args, int32_t argC
     return RValue_makeStructAndIncRef(ret);
 }
 
+// ===[ PARTICLE FUNCTIONS ]===
+// Thin bindings over particles.c. Everything that can be asked of a dead id returns undefined rather
+// than faulting, matching GameMaker, where calling a part_* setter on a destroyed id is a silent no-op.
+
+static RValue builtin_part_system_create(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    return RValue_makeReal((GMLReal) Particles_systemCreate(ctx->runner));
+}
+
+static RValue builtin_part_system_destroy(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Particles_systemDestroy(ctx->runner, RValue_toInt32(args[0]));
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_system_depth(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Particles_systemSetDepth(ctx->runner, RValue_toInt32(args[0]), RValue_toInt32(args[1]));
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_system_automatic_draw(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Particles_systemSetAutomaticDraw(ctx->runner, RValue_toInt32(args[0]), RValue_toBool(args[1]));
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_system_update(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Particles_updateSystem(ctx->runner, RValue_toInt32(args[0]));
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_system_drawit(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Particles_drawSystem(ctx->runner, RValue_toInt32(args[0]));
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_type_create(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    return RValue_makeReal((GMLReal) Particles_typeCreate(ctx->runner));
+}
+
+static RValue builtin_part_type_destroy(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Particles_typeDestroy(ctx->runner, RValue_toInt32(args[0]));
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_type_sprite(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    ParticleType* type = Particles_typeGet(ctx->runner, RValue_toInt32(args[0]));
+    if (type == nullptr) return RValue_makeUndefined();
+    type->sprite = RValue_toInt32(args[1]);
+    type->spriteAnimate = RValue_toBool(args[2]);
+    type->spriteStretch = RValue_toBool(args[3]);
+    type->spriteRandom = RValue_toBool(args[4]);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_type_size(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    ParticleType* type = Particles_typeGet(ctx->runner, RValue_toInt32(args[0]));
+    if (type == nullptr) return RValue_makeUndefined();
+    type->sizeMin = RValue_toReal(args[1]);
+    type->sizeMax = RValue_toReal(args[2]);
+    type->sizeIncr = RValue_toReal(args[3]);
+    type->sizeWiggle = RValue_toReal(args[4]);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_type_scale(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    ParticleType* type = Particles_typeGet(ctx->runner, RValue_toInt32(args[0]));
+    if (type == nullptr) return RValue_makeUndefined();
+    type->scaleX = RValue_toReal(args[1]);
+    type->scaleY = RValue_toReal(args[2]);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_type_speed(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    ParticleType* type = Particles_typeGet(ctx->runner, RValue_toInt32(args[0]));
+    if (type == nullptr) return RValue_makeUndefined();
+    type->speedMin = RValue_toReal(args[1]);
+    type->speedMax = RValue_toReal(args[2]);
+    type->speedIncr = RValue_toReal(args[3]);
+    type->speedWiggle = RValue_toReal(args[4]);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_type_direction(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    ParticleType* type = Particles_typeGet(ctx->runner, RValue_toInt32(args[0]));
+    if (type == nullptr) return RValue_makeUndefined();
+    // Stored unnormalised on purpose: games pass reversed ranges (DELTARUNE Chapter 4 uses -45 to -90)
+    // and expect GameMaker's "min + random * (max - min)", which sweeps downward.
+    type->dirMin = RValue_toReal(args[1]);
+    type->dirMax = RValue_toReal(args[2]);
+    type->dirIncr = RValue_toReal(args[3]);
+    type->dirWiggle = RValue_toReal(args[4]);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_type_gravity(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    ParticleType* type = Particles_typeGet(ctx->runner, RValue_toInt32(args[0]));
+    if (type == nullptr) return RValue_makeUndefined();
+    type->gravityAmount = RValue_toReal(args[1]);
+    type->gravityDirection = RValue_toReal(args[2]);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_type_life(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    ParticleType* type = Particles_typeGet(ctx->runner, RValue_toInt32(args[0]));
+    if (type == nullptr) return RValue_makeUndefined();
+    type->lifeMin = RValue_toInt32(args[1]);
+    type->lifeMax = RValue_toInt32(args[2]);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_type_alpha3(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    ParticleType* type = Particles_typeGet(ctx->runner, RValue_toInt32(args[0]));
+    if (type == nullptr) return RValue_makeUndefined();
+    type->alphaStart = RValue_toReal(args[1]);
+    type->alphaMiddle = RValue_toReal(args[2]);
+    type->alphaEnd = RValue_toReal(args[3]);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_type_blend(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    ParticleType* type = Particles_typeGet(ctx->runner, RValue_toInt32(args[0]));
+    if (type == nullptr) return RValue_makeUndefined();
+    type->additive = RValue_toBool(args[1]);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_type_death(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    ParticleType* type = Particles_typeGet(ctx->runner, RValue_toInt32(args[0]));
+    if (type == nullptr) return RValue_makeUndefined();
+    type->deathNumber = RValue_toInt32(args[1]);
+    type->deathType = RValue_toInt32(args[2]);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_emitter_create(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    return RValue_makeReal((GMLReal) Particles_emitterCreate(ctx->runner, RValue_toInt32(args[0])));
+}
+
+static RValue builtin_part_emitter_destroy(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Particles_emitterDestroy(ctx->runner, RValue_toInt32(args[0]), RValue_toInt32(args[1]));
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_emitter_destroy_all(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Particles_emitterDestroyAll(ctx->runner, RValue_toInt32(args[0]));
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_emitter_region(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    ParticleEmitter* emitter = Particles_emitterGet(ctx->runner, RValue_toInt32(args[0]), RValue_toInt32(args[1]));
+    if (emitter == nullptr) return RValue_makeUndefined();
+    emitter->xmin = RValue_toReal(args[2]);
+    emitter->xmax = RValue_toReal(args[3]);
+    emitter->ymin = RValue_toReal(args[4]);
+    emitter->ymax = RValue_toReal(args[5]);
+    emitter->shape = RValue_toInt32(args[6]);
+    emitter->distribution = RValue_toInt32(args[7]);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_emitter_stream(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    ParticleEmitter* emitter = Particles_emitterGet(ctx->runner, RValue_toInt32(args[0]), RValue_toInt32(args[1]));
+    if (emitter == nullptr) return RValue_makeUndefined();
+    emitter->streamType = RValue_toInt32(args[2]);
+    emitter->streamNumber = RValue_toInt32(args[3]);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_emitter_burst(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Particles_emitterBurst(ctx->runner, RValue_toInt32(args[0]), RValue_toInt32(args[1]), RValue_toInt32(args[2]), RValue_toInt32(args[3]));
+    return RValue_makeUndefined();
+}
+
 // ===[ REGISTRATION ]===
 
 void VMBuiltins_registerAll(VMContext* ctx) {
@@ -17465,6 +17636,32 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "mp_grid_get_cell", builtin_mp_grid_get_cell);
     VM_registerBuiltin(ctx, "mp_grid_draw", builtin_mp_grid_draw);
     VM_registerBuiltin(ctx, "mp_grid_path", builtin_mp_grid_path);
+
+    // Particles
+    VM_registerBuiltin(ctx, "part_system_create", builtin_part_system_create);
+    VM_registerBuiltin(ctx, "part_system_destroy", builtin_part_system_destroy);
+    VM_registerBuiltin(ctx, "part_system_depth", builtin_part_system_depth);
+    VM_registerBuiltin(ctx, "part_system_automatic_draw", builtin_part_system_automatic_draw);
+    VM_registerBuiltin(ctx, "part_system_update", builtin_part_system_update);
+    VM_registerBuiltin(ctx, "part_system_drawit", builtin_part_system_drawit);
+    VM_registerBuiltin(ctx, "part_type_create", builtin_part_type_create);
+    VM_registerBuiltin(ctx, "part_type_destroy", builtin_part_type_destroy);
+    VM_registerBuiltin(ctx, "part_type_sprite", builtin_part_type_sprite);
+    VM_registerBuiltin(ctx, "part_type_size", builtin_part_type_size);
+    VM_registerBuiltin(ctx, "part_type_scale", builtin_part_type_scale);
+    VM_registerBuiltin(ctx, "part_type_speed", builtin_part_type_speed);
+    VM_registerBuiltin(ctx, "part_type_direction", builtin_part_type_direction);
+    VM_registerBuiltin(ctx, "part_type_gravity", builtin_part_type_gravity);
+    VM_registerBuiltin(ctx, "part_type_life", builtin_part_type_life);
+    VM_registerBuiltin(ctx, "part_type_alpha3", builtin_part_type_alpha3);
+    VM_registerBuiltin(ctx, "part_type_blend", builtin_part_type_blend);
+    VM_registerBuiltin(ctx, "part_type_death", builtin_part_type_death);
+    VM_registerBuiltin(ctx, "part_emitter_create", builtin_part_emitter_create);
+    VM_registerBuiltin(ctx, "part_emitter_destroy", builtin_part_emitter_destroy);
+    VM_registerBuiltin(ctx, "part_emitter_destroy_all", builtin_part_emitter_destroy_all);
+    VM_registerBuiltin(ctx, "part_emitter_region", builtin_part_emitter_region);
+    VM_registerBuiltin(ctx, "part_emitter_stream", builtin_part_emitter_stream);
+    VM_registerBuiltin(ctx, "part_emitter_burst", builtin_part_emitter_burst);
 
     // Misc
     VM_registerBuiltin(ctx, "get_timer", builtin_get_timer);

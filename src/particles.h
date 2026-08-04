@@ -55,13 +55,23 @@ typedef struct {
     GMLReal gravityAmount;
     GMLReal gravityDirection;
 
+    // Drawn orientation. Independent of the direction of travel unless angRelative is set, in which
+    // case the angle is measured from it.
+    GMLReal angMin, angMax, angIncr, angWiggle;
+    bool angRelative;
+
     int32_t lifeMin, lifeMax;
 
+    // Alpha and colour both run through three stops across the particle's life: start, middle at the
+    // halfway mark, end. part_type_alpha1/alpha2 and part_type_colour1/colour2 collapse the stops.
     GMLReal alphaStart, alphaMiddle, alphaEnd;
+    uint32_t colourStart, colourMiddle, colourEnd; // GML packed BGR, as the drawing functions take it
     bool additive;
 
     int32_t deathType;   // type id spawned when a particle of this type dies, -1 when none
     int32_t deathNumber; // how many to spawn; negative means a 1-in-|n| chance
+    int32_t stepType;    // type id spawned every step a particle of this type lives, -1 when none
+    int32_t stepNumber;  // same "negative means a chance" convention as deathNumber
 } ParticleType;
 
 typedef struct {
@@ -70,9 +80,12 @@ typedef struct {
     GMLReal speed;      // base speed, before wiggle
     GMLReal direction;  // base direction in degrees, before wiggle
     GMLReal size;       // base size, before wiggle
+    GMLReal angle;      // drawn orientation in degrees, before wiggle
     int32_t life;       // steps remaining
     int32_t lifeTotal;  // steps this particle started with, for the alpha/animation curves
     int32_t subimgBase; // starting subimage
+    uint32_t colour;    // set by part_particles_create_colour; overrides the type's colour curve
+    bool colourFixed;   // true when "colour" above is in force
     uint8_t phase;      // wiggle phase, advanced every step
 } Particle;
 
@@ -90,6 +103,7 @@ typedef struct {
     bool automaticUpdate; // step the system at the end of every frame (on by default, as in GML)
     bool automaticDraw;   // draw the system from the depth list (on by default, as in GML)
     int32_t depth;
+    GMLReal originX, originY;  // part_system_position: added to every particle when drawing
     bool warnedFull;      // the "hit PARTICLE_SYSTEM_MAX_PARTICLES" warning fires once per system
     Particle* particles;  // stb_ds array
     ParticleEmitter* emitters; // stb_ds array, index = emitter id within this system
@@ -101,11 +115,25 @@ void Particles_systemDestroy(Runner* runner, int32_t systemId);
 ParticleSystem* Particles_systemGet(Runner* runner, int32_t systemId);
 void Particles_systemSetDepth(Runner* runner, int32_t systemId, int32_t depth);
 void Particles_systemSetAutomaticDraw(Runner* runner, int32_t systemId, bool automatic);
+// Resets the system to how part_system_create left it: no particles, no emitters, depth 0, both
+// automatic flags back on.
+void Particles_systemClear(Runner* runner, int32_t systemId);
+// Removes every live particle but leaves the emitters and settings in place.
+void Particles_systemClearParticles(Runner* runner, int32_t systemId);
+int32_t Particles_systemParticleCount(Runner* runner, int32_t systemId);
+// Spawns particles directly, bypassing emitters. "colour" is honoured only when fixedColour is set,
+// which is what separates part_particles_create_colour from part_particles_create.
+void Particles_particlesCreate(Runner* runner, int32_t systemId, GMLReal x, GMLReal y, int32_t typeId, int32_t number, uint32_t colour, bool fixedColour);
 
 // ===[ Types ]===
 int32_t Particles_typeCreate(Runner* runner);
 void Particles_typeDestroy(Runner* runner, int32_t typeId);
+// Puts a live type back to the defaults a freshly created one has.
+void Particles_typeClear(Runner* runner, int32_t typeId);
 ParticleType* Particles_typeGet(Runner* runner, int32_t typeId);
+// Blend of two GML colours, used by part_type_colour2 to place the middle stop of a two-stop curve
+// on the straight line between its ends.
+uint32_t Particles_colourMidpoint(uint32_t from, uint32_t to);
 
 // ===[ Emitters ]===
 int32_t Particles_emitterCreate(Runner* runner, int32_t systemId);

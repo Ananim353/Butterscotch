@@ -116,6 +116,54 @@ void Particles_systemSetAutomaticDraw(Runner* runner, int32_t systemId, bool aut
     runner->drawableListStructureDirty = true;
 }
 
+void Particles_systemClear(Runner* runner, int32_t systemId) {
+    ParticleSystem* system = Particles_systemGet(runner, systemId);
+    if (system == nullptr) return;
+
+    arrsetlen(system->particles, 0);
+    arrsetlen(system->emitters, 0);
+    system->automaticUpdate = true;
+    system->automaticDraw = true;
+    system->depth = 0;
+    system->originX = 0.0;
+    system->originY = 0.0;
+    system->warnedFull = false;
+    // Depth and automatic drawing both just moved, so the cached list has to be rebuilt either way.
+    runner->drawableListStructureDirty = true;
+}
+
+void Particles_systemClearParticles(Runner* runner, int32_t systemId) {
+    ParticleSystem* system = Particles_systemGet(runner, systemId);
+    if (system == nullptr) return;
+    arrsetlen(system->particles, 0);
+}
+
+int32_t Particles_systemParticleCount(Runner* runner, int32_t systemId) {
+    ParticleSystem* system = Particles_systemGet(runner, systemId);
+    return (system == nullptr) ? 0 : (int32_t) arrlen(system->particles);
+}
+
+// GameMaker's defaults for a fresh type: one white unit-sized particle, no motion, 100 steps.
+static void particleTypeSetDefaults(ParticleType* type) {
+    ZERO_STRUCT(*type);
+    type->used = true;
+    type->sprite = -1;
+    type->sizeMin = 1.0;
+    type->sizeMax = 1.0;
+    type->scaleX = 1.0;
+    type->scaleY = 1.0;
+    type->lifeMin = 100;
+    type->lifeMax = 100;
+    type->alphaStart = 1.0;
+    type->alphaMiddle = 1.0;
+    type->alphaEnd = 1.0;
+    type->colourStart = 0xFFFFFFu;
+    type->colourMiddle = 0xFFFFFFu;
+    type->colourEnd = 0xFFFFFFu;
+    type->deathType = -1;
+    type->stepType = -1;
+}
+
 int32_t Particles_typeCreate(Runner* runner) {
     int32_t poolSize = (int32_t) arrlen(runner->particleTypePool);
     int32_t id = poolSize;
@@ -123,21 +171,8 @@ int32_t Particles_typeCreate(Runner* runner) {
         if (!runner->particleTypePool[i].used) { id = (int32_t) i; break; }
     }
 
-    // GameMaker's defaults for a fresh type: a single white pixel-sized particle, no motion, 100 steps.
     ParticleType type;
-    ZERO_STRUCT(type);
-    type.used = true;
-    type.sprite = -1;
-    type.sizeMin = 1.0;
-    type.sizeMax = 1.0;
-    type.scaleX = 1.0;
-    type.scaleY = 1.0;
-    type.lifeMin = 100;
-    type.lifeMax = 100;
-    type.alphaStart = 1.0;
-    type.alphaMiddle = 1.0;
-    type.alphaEnd = 1.0;
-    type.deathType = -1;
+    particleTypeSetDefaults(&type);
 
     if (id == poolSize) {
         arrput(runner->particleTypePool, type);
@@ -145,6 +180,12 @@ int32_t Particles_typeCreate(Runner* runner) {
         runner->particleTypePool[id] = type;
     }
     return id;
+}
+
+void Particles_typeClear(Runner* runner, int32_t typeId) {
+    ParticleType* type = Particles_typeGet(runner, typeId);
+    if (type == nullptr) return;
+    particleTypeSetDefaults(type);
 }
 
 void Particles_typeDestroy(Runner* runner, int32_t typeId) {
@@ -202,7 +243,7 @@ void Particles_emitterDestroyAll(Runner* runner, int32_t systemId) {
 
 // ===[ Spawning ]===
 
-static void particleSpawnAt(Runner* runner, ParticleSystem* system, int32_t typeId, GMLReal x, GMLReal y) {
+static void particleSpawnAt(Runner* runner, ParticleSystem* system, int32_t typeId, GMLReal x, GMLReal y, uint32_t colour, bool fixedColour) {
     ParticleType* type = Particles_typeGet(runner, typeId);
     if (type == nullptr) return;
 
@@ -222,6 +263,9 @@ static void particleSpawnAt(Runner* runner, ParticleSystem* system, int32_t type
     particle.speed = particleRandomRange(type->speedMin, type->speedMax);
     particle.direction = particleRandomRange(type->dirMin, type->dirMax);
     particle.size = particleRandomRange(type->sizeMin, type->sizeMax);
+    particle.angle = particleRandomRange(type->angMin, type->angMax);
+    particle.colour = colour;
+    particle.colourFixed = fixedColour;
     particle.lifeTotal = (int32_t) particleRandomRange((GMLReal) type->lifeMin, (GMLReal) type->lifeMax);
     if (1 > particle.lifeTotal) particle.lifeTotal = 1;
     particle.life = particle.lifeTotal;
@@ -275,7 +319,7 @@ static void particleEmitterSpawn(Runner* runner, ParticleSystem* system, Particl
     repeat(count, i) {
         GMLReal x, y;
         particleEmitterPoint(emitter, &x, &y);
-        particleSpawnAt(runner, system, typeId, x, y);
+        particleSpawnAt(runner, system, typeId, x, y, 0xFFFFFFu, false);
     }
 }
 
@@ -284,6 +328,14 @@ void Particles_emitterBurst(Runner* runner, int32_t systemId, int32_t emitterId,
     ParticleEmitter* emitter = Particles_emitterGet(runner, systemId, emitterId);
     if (system == nullptr || emitter == nullptr) return;
     particleEmitterSpawn(runner, system, emitter, typeId, particleResolveCount(number));
+}
+
+void Particles_particlesCreate(Runner* runner, int32_t systemId, GMLReal x, GMLReal y, int32_t typeId, int32_t number, uint32_t colour, bool fixedColour) {
+    ParticleSystem* system = Particles_systemGet(runner, systemId);
+    if (system == nullptr) return;
+    repeat(number, i) {
+        particleSpawnAt(runner, system, typeId, x, y, colour, fixedColour);
+    }
 }
 
 // ===[ Update ]===
@@ -300,11 +352,11 @@ void Particles_updateSystem(Runner* runner, int32_t systemId) {
         particleEmitterSpawn(runner, system, emitter, emitter->streamType, particleResolveCount(emitter->streamNumber));
     }
 
-    // Deaths are collected and spawned after the movement pass: spawning mid-loop can realloc the
-    // array out from under the iteration, and a death particle must not be stepped on its spawn frame.
-    // Only allocated when a type actually has a death type, which is rare.
-    typedef struct { int32_t typeId; GMLReal x, y; int32_t count; } PendingDeath;
-    PendingDeath* deaths = nullptr;
+    // part_type_step and part_type_death spawns are collected and run after the movement pass:
+    // spawning mid-loop can realloc the array out from under the iteration, and the new particles
+    // must not be stepped on their own spawn frame. Only allocated when a type actually asks for it.
+    typedef struct { int32_t typeId; GMLReal x, y; int32_t count; } PendingSpawn;
+    PendingSpawn* pending = nullptr;
 
     int32_t index = 0;
     while (index < (int32_t) arrlen(system->particles)) {
@@ -343,9 +395,22 @@ void Particles_updateSystem(Runner* runner, int32_t systemId) {
         particle->direction += type->dirIncr;
         particle->size += type->sizeIncr;
         if (0.0 > particle->size) particle->size = 0.0;
+        particle->angle += type->angIncr;
 
         particle->phase = (uint8_t) ((particle->phase + 8u) & 0xFFu);
         particle->life--;
+
+        if (type->stepType >= 0 && type->stepNumber != 0) {
+            int32_t count = particleResolveCount(type->stepNumber);
+            if (count > 0) {
+                PendingSpawn spawn;
+                spawn.typeId = type->stepType;
+                spawn.x = particle->x;
+                spawn.y = particle->y;
+                spawn.count = count;
+                arrput(pending, spawn);
+            }
+        }
 
         if (particle->life > 0) {
             index++;
@@ -355,12 +420,12 @@ void Particles_updateSystem(Runner* runner, int32_t systemId) {
         if (type->deathType >= 0 && type->deathNumber != 0) {
             int32_t count = particleResolveCount(type->deathNumber);
             if (count > 0) {
-                PendingDeath death;
-                death.typeId = type->deathType;
-                death.x = particle->x;
-                death.y = particle->y;
-                death.count = count;
-                arrput(deaths, death);
+                PendingSpawn spawn;
+                spawn.typeId = type->deathType;
+                spawn.x = particle->x;
+                spawn.y = particle->y;
+                spawn.count = count;
+                arrput(pending, spawn);
             }
         }
 
@@ -370,12 +435,12 @@ void Particles_updateSystem(Runner* runner, int32_t systemId) {
         arrpop(system->particles);
     }
 
-    repeat((int32_t) arrlen(deaths), i) {
-        repeat(deaths[i].count, n) {
-            particleSpawnAt(runner, system, deaths[i].typeId, deaths[i].x, deaths[i].y);
+    repeat((int32_t) arrlen(pending), i) {
+        repeat(pending[i].count, n) {
+            particleSpawnAt(runner, system, pending[i].typeId, pending[i].x, pending[i].y, 0xFFFFFFu, false);
         }
     }
-    arrfree(deaths);
+    arrfree(pending);
 }
 
 void Particles_updateAutomatic(Runner* runner) {
@@ -398,6 +463,32 @@ static GMLReal particleAlphaAt(const ParticleType* type, GMLReal ageFraction) {
     }
     GMLReal t = (ageFraction - 0.5) * 2.0;
     return type->alphaMiddle + (type->alphaEnd - type->alphaMiddle) * t;
+}
+
+// Same three stops as the alpha curve. Interpolated per byte, which is correct whatever order the
+// channels sit in: GML colours are passed straight through to the renderer without repacking.
+static uint32_t particleColourLerp(uint32_t from, uint32_t to, GMLReal t) {
+    uint32_t out = 0;
+    repeat(3, shift) {
+        int32_t bits = (int32_t) shift * 8;
+        GMLReal a = (GMLReal) ((from >> bits) & 0xFFu);
+        GMLReal b = (GMLReal) ((to >> bits) & 0xFFu);
+        int32_t v = (int32_t) (a + (b - a) * t + 0.5);
+        if (0 > v) v = 0;
+        if (v > 255) v = 255;
+        out |= ((uint32_t) v) << bits;
+    }
+    return out;
+}
+
+uint32_t Particles_colourMidpoint(uint32_t from, uint32_t to) {
+    return particleColourLerp(from, to, 0.5);
+}
+
+static uint32_t particleColourAt(const ParticleType* type, GMLReal ageFraction) {
+    if (0.5 > ageFraction)
+        return particleColourLerp(type->colourStart, type->colourMiddle, ageFraction * 2.0);
+    return particleColourLerp(type->colourMiddle, type->colourEnd, (ageFraction - 0.5) * 2.0);
 }
 
 void Particles_drawSystem(Runner* runner, int32_t systemId) {
@@ -446,10 +537,17 @@ void Particles_drawSystem(Runner* runner, int32_t systemId) {
             blendChanged = true;
         }
 
+        uint32_t colour = particle->colourFixed ? particle->colour : particleColourAt(type, ageFraction);
+
+        // A relative orientation is measured from the direction the particle is travelling, so a
+        // sprite drawn nose-first keeps pointing along its arc as gravity bends it.
+        GMLReal angle = particle->angle + type->angWiggle * particleWiggle(particle->phase);
+        if (type->angRelative) angle += particle->direction;
+
         Renderer_drawSpriteExt(renderer, type->sprite, subimg,
-                               (float) particle->x, (float) particle->y,
+                               (float) (system->originX + particle->x), (float) (system->originY + particle->y),
                                (float) (type->scaleX * size), (float) (type->scaleY * size),
-                               0.0f, 0xFFFFFFu, (float) alpha);
+                               (float) angle, colour, (float) alpha);
     }
 
     if (blendChanged && additiveActive)

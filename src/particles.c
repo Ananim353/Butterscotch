@@ -14,7 +14,8 @@
 // particle spawn shift the sequence the game itself sees, so merely adding a particle effect to a
 // scene would change unrelated randomised behaviour (and every seeded screenshot test with it).
 // The trade-off is that --seed and randomize() do not reach particles.
-static uint32_t g_particleRngState = 0x9E3779B9u;
+#define PARTICLE_RNG_SEED 0x9E3779B9u
+static uint32_t g_particleRngState = PARTICLE_RNG_SEED;
 
 static uint32_t particleRandomBits(void) {
     uint32_t x = g_particleRngState;
@@ -48,8 +49,17 @@ static GMLReal particleWiggle(uint8_t phase) {
 // value is a literal count, a negative value is a 1-in-|number| chance of spawning a single particle.
 static int32_t particleResolveCount(int32_t number) {
     if (number >= 0) return number;
-    int32_t chance = -number;
-    return ((int32_t) (particleRandomBits() % (uint32_t) chance) == 0) ? 1 : 0;
+    // Negated as unsigned: -INT32_MIN does not fit back into int32_t.
+    uint32_t chance = (uint32_t) -(int64_t) number;
+    return (particleRandomBits() % chance == 0) ? 1 : 0;
+}
+
+// Uniform integer in [min, max] with both ends included, which is how GameMaker reads part_type_life.
+// Truncating a real drawn from [min, max) would never return max.
+static int32_t particleRandomIntRange(int32_t min, int32_t max) {
+    GMLReal span = (GMLReal) max - (GMLReal) min;
+    span += (span >= 0.0) ? 1.0 : -1.0;
+    return min + (int32_t) (particleRandom01() * span);
 }
 
 // ===[ Pools ]===
@@ -112,8 +122,11 @@ void Particles_systemSetAutomaticDraw(Runner* runner, int32_t systemId, bool aut
     ParticleSystem* system = Particles_systemGet(runner, systemId);
     if (system == nullptr || system->automaticDraw == automatic) return;
     system->automaticDraw = automatic;
-    // Entering or leaving the depth list changes the SET of drawables, not just their order.
-    runner->drawableListStructureDirty = true;
+    // Only switching drawing ON has to rebuild, since that is what adds an entry the cache does not
+    // hold. Switching it off is filtered at draw time, like instance visibility, so the common
+    // "automatic_draw(false) then drawit()" idiom re-issued every frame does not drag a full rebuild
+    // and re-sort of every drawable in the room behind it.
+    if (automatic) runner->drawableListStructureDirty = true;
 }
 
 void Particles_systemClear(Runner* runner, int32_t systemId) {
@@ -243,16 +256,18 @@ void Particles_emitterDestroyAll(Runner* runner, int32_t systemId) {
 
 // ===[ Spawning ]===
 
-static void particleSpawnAt(Runner* runner, ParticleSystem* system, int32_t typeId, GMLReal x, GMLReal y, uint32_t colour, bool fixedColour) {
+// Returns false once the system is full, so the callers' loops can stop instead of spinning through a
+// spawn count that came straight from GML and may be enormous.
+static bool particleSpawnAt(Runner* runner, ParticleSystem* system, int32_t typeId, GMLReal x, GMLReal y, uint32_t colour, bool fixedColour) {
     ParticleType* type = Particles_typeGet(runner, typeId);
-    if (type == nullptr) return;
+    if (type == nullptr) return false;
 
     if ((int32_t) arrlen(system->particles) >= PARTICLE_SYSTEM_MAX_PARTICLES) {
         if (!system->warnedFull) {
             system->warnedFull = true;
             logWarn("Particles: system hit the %d particle cap, further spawns are dropped\n", PARTICLE_SYSTEM_MAX_PARTICLES);
         }
-        return;
+        return false;
     }
 
     Particle particle;
@@ -266,7 +281,7 @@ static void particleSpawnAt(Runner* runner, ParticleSystem* system, int32_t type
     particle.angle = particleRandomRange(type->angMin, type->angMax);
     particle.colour = colour;
     particle.colourFixed = fixedColour;
-    particle.lifeTotal = (int32_t) particleRandomRange((GMLReal) type->lifeMin, (GMLReal) type->lifeMax);
+    particle.lifeTotal = particleRandomIntRange(type->lifeMin, type->lifeMax);
     if (1 > particle.lifeTotal) particle.lifeTotal = 1;
     particle.life = particle.lifeTotal;
     particle.phase = (uint8_t) (particleRandomBits() & 0xFFu);
@@ -277,49 +292,61 @@ static void particleSpawnAt(Runner* runner, ParticleSystem* system, int32_t type
     }
 
     arrput(system->particles, particle);
+    return true;
 }
 
 // Picks a point inside the emitter's region. Only the linear distribution is modelled; the gaussian
 // ones fall back to it (no game we test against uses them, and guessing at the curve would be worse
 // than an honest uniform spread).
 static void particleEmitterPoint(ParticleEmitter* emitter, GMLReal* outX, GMLReal* outY) {
-    GMLReal x = particleRandomRange(emitter->xmin, emitter->xmax);
-    GMLReal y = particleRandomRange(emitter->ymin, emitter->ymax);
-
     GMLReal centerX = (emitter->xmin + emitter->xmax) * 0.5;
     GMLReal centerY = (emitter->ymin + emitter->ymax) * 0.5;
     GMLReal halfW = (emitter->xmax - emitter->xmin) * 0.5;
     GMLReal halfH = (emitter->ymax - emitter->ymin) * 0.5;
 
-    if (emitter->shape == PS_SHAPE_ELLIPSE || emitter->shape == PS_SHAPE_DIAMOND) {
-        // Rejection sampling keeps the spread uniform. The regions are small and the acceptance rate
-        // is 0.79 (ellipse) / 0.5 (diamond), so the loop is bounded in practice; cap it anyway.
-        repeat(8, attempt) {
-            GMLReal nx = (halfW > 0.0) ? (x - centerX) / halfW : 0.0;
-            GMLReal ny = (halfH > 0.0) ? (y - centerY) / halfH : 0.0;
-            bool inside = (emitter->shape == PS_SHAPE_ELLIPSE)
-                        ? (nx * nx + ny * ny <= 1.0)
-                        : (GMLReal_fabs(nx) + GMLReal_fabs(ny) <= 1.0);
-            if (inside) break;
-            x = particleRandomRange(emitter->xmin, emitter->xmax);
-            y = particleRandomRange(emitter->ymin, emitter->ymax);
-        }
-    } else if (emitter->shape == PS_SHAPE_LINE) {
-        // A line from (xmin, ymin) to (xmax, ymax), not the rectangle they bound.
-        GMLReal t = particleRandom01();
-        x = emitter->xmin + (emitter->xmax - emitter->xmin) * t;
-        y = emitter->ymin + (emitter->ymax - emitter->ymin) * t;
+    // Every shape is sampled directly rather than by rejection. Beyond being cheaper and branch-free,
+    // it cannot emit outside the region: a bounded rejection loop has to accept whatever it holds when
+    // the attempts run out, which for a diamond (half the bounding box) leaks a particle into a corner
+    // often enough to see.
+    if (emitter->shape == PS_SHAPE_ELLIPSE) {
+        // sqrt on the radius keeps the spread uniform by area instead of clustering at the centre.
+        GMLReal radius = GMLReal_sqrt(particleRandom01());
+        GMLReal angle = particleRandom01() * 2.0 * M_PI;
+        *outX = centerX + halfW * radius * GMLReal_cos(angle);
+        *outY = centerY + halfH * radius * GMLReal_sin(angle);
+        return;
     }
 
-    *outX = x;
-    *outY = y;
+    if (emitter->shape == PS_SHAPE_DIAMOND) {
+        // Fold the unit square onto the triangle u + v <= 1, then mirror into a random quadrant.
+        GMLReal u = particleRandom01();
+        GMLReal v = particleRandom01();
+        if (u + v > 1.0) { u = 1.0 - u; v = 1.0 - v; }
+        uint32_t quadrant = particleRandomBits();
+        if (quadrant & 1u) u = -u;
+        if (quadrant & 2u) v = -v;
+        *outX = centerX + halfW * u;
+        *outY = centerY + halfH * v;
+        return;
+    }
+
+    if (emitter->shape == PS_SHAPE_LINE) {
+        // A line from (xmin, ymin) to (xmax, ymax), not the rectangle they bound.
+        GMLReal t = particleRandom01();
+        *outX = emitter->xmin + (emitter->xmax - emitter->xmin) * t;
+        *outY = emitter->ymin + (emitter->ymax - emitter->ymin) * t;
+        return;
+    }
+
+    *outX = particleRandomRange(emitter->xmin, emitter->xmax);
+    *outY = particleRandomRange(emitter->ymin, emitter->ymax);
 }
 
 static void particleEmitterSpawn(Runner* runner, ParticleSystem* system, ParticleEmitter* emitter, int32_t typeId, int32_t count) {
     repeat(count, i) {
         GMLReal x, y;
         particleEmitterPoint(emitter, &x, &y);
-        particleSpawnAt(runner, system, typeId, x, y, 0xFFFFFFu, false);
+        if (!particleSpawnAt(runner, system, typeId, x, y, 0xFFFFFFu, false)) return;
     }
 }
 
@@ -334,7 +361,7 @@ void Particles_particlesCreate(Runner* runner, int32_t systemId, GMLReal x, GMLR
     ParticleSystem* system = Particles_systemGet(runner, systemId);
     if (system == nullptr) return;
     repeat(number, i) {
-        particleSpawnAt(runner, system, typeId, x, y, colour, fixedColour);
+        if (!particleSpawnAt(runner, system, typeId, x, y, colour, fixedColour)) return;
     }
 }
 
@@ -437,7 +464,7 @@ void Particles_updateSystem(Runner* runner, int32_t systemId) {
 
     repeat((int32_t) arrlen(pending), i) {
         repeat(pending[i].count, n) {
-            particleSpawnAt(runner, system, pending[i].typeId, pending[i].x, pending[i].y, 0xFFFFFFu, false);
+            if (!particleSpawnAt(runner, system, pending[i].typeId, pending[i].x, pending[i].y, 0xFFFFFFu, false)) break;
         }
     }
     arrfree(pending);
@@ -499,8 +526,16 @@ void Particles_drawSystem(Runner* runner, int32_t systemId) {
     if (count == 0) return;
 
     Renderer* renderer = runner->renderer;
-    bool blendChanged = false;
     bool additiveActive = false;
+    // Blend state is global and sticky in GML, so an additive type has to hand back exactly what the
+    // caller had rather than assuming bm_normal: a game that darkens the scene with
+    // gpu_set_blendmode_ext around its draw would otherwise lose the effect from the particle system
+    // onwards. Captured lazily, so a system of ordinary particles never touches blending at all.
+    bool blendTouched = false;
+    bool blendSaved = false;
+    int32_t savedBlendMode = bm_normal;
+    BlendFactors savedBlendFactors;
+    ZERO_STRUCT(savedBlendFactors);
 
     repeat(count, i) {
         Particle* particle = &system->particles[i];
@@ -527,14 +562,20 @@ void Particles_drawSystem(Runner* runner, int32_t systemId) {
             }
         }
 
-        // Only touched when an additive type is actually present, so a system of ordinary particles
-        // leaves whatever blend mode the caller had set alone. There is no way to read the current
-        // mode back out of the renderer, so once we do touch it the restore below can only go to
-        // bm_normal, which is the mode GameMaker itself leaves behind after drawing a system.
         if (type->additive != additiveActive) {
+            if (!blendTouched) {
+                // The getters are optional in the vtable; without them the best we can do is put
+                // blending back to bm_normal at the end.
+                if (renderer->vtable->gpuGetBlendMode != nullptr) {
+                    savedBlendMode = renderer->vtable->gpuGetBlendMode(renderer);
+                    if (renderer->vtable->gpuGetBlendFactors != nullptr)
+                        savedBlendFactors = renderer->vtable->gpuGetBlendFactors(renderer);
+                    blendSaved = true;
+                }
+                blendTouched = true;
+            }
             renderer->vtable->gpuSetBlendMode(renderer, type->additive ? bm_add : bm_normal);
             additiveActive = type->additive;
-            blendChanged = true;
         }
 
         uint32_t colour = particle->colourFixed ? particle->colour : particleColourAt(type, ageFraction);
@@ -550,8 +591,18 @@ void Particles_drawSystem(Runner* runner, int32_t systemId) {
                                (float) angle, colour, (float) alpha);
     }
 
-    if (blendChanged && additiveActive)
+    if (!blendTouched) return;
+
+    if (!blendSaved) {
         renderer->vtable->gpuSetBlendMode(renderer, bm_normal);
+    } else if (savedBlendMode == bm_complex && renderer->vtable->gpuSetBlendModeExt != nullptr) {
+        // gpu_set_blendmode_ext leaves the mode reading back as bm_complex, so the individual
+        // factors are the only faithful way to put that state back.
+        renderer->vtable->gpuSetBlendModeExt(renderer, savedBlendFactors.src, savedBlendFactors.dst,
+                                             savedBlendFactors.srcAlpha, savedBlendFactors.dstAlpha);
+    } else {
+        renderer->vtable->gpuSetBlendMode(renderer, savedBlendMode);
+    }
 }
 
 // ===[ Teardown ]===
@@ -566,4 +617,7 @@ void Particles_freeAll(Runner* runner) {
     runner->particleSystemPool = nullptr;
     arrfree(runner->particleTypePool);
     runner->particleTypePool = nullptr;
+    // Reached on game_restart as well as shutdown, so put the stream back to where it started:
+    // a restarted game should produce the same particles as the first run.
+    g_particleRngState = PARTICLE_RNG_SEED;
 }

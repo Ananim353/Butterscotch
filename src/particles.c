@@ -32,30 +32,47 @@ static GMLReal particleRandom01(void) {
 }
 
 // Uniform between the two bounds. Deliberately NOT normalised to (min <= max): GameMaker computes
-// "min + random * (max - min)", and games depend on the reversed form. part_type_direction(-45, -90)
-// in DELTARUNE Chapter 4 sweeps downward from -45, and swapping the bounds would flip the spray.
+// "min + random * (max - min)" and lets a reversed pair sweep downward, which games rely on.
+// DELTARUNE Chapter 5 calls part_type_direction with (-1, -165), (-45, -90) and (-40, -90); each is
+// a fan that collapses into a single direction the moment the ends are clamped.
+//
+// Worth spelling out because the HTML5 runtime disagrees: its MyRandom() returns the low bound
+// whenever (max - min) <= 0, so those three sprays would come out as straight jets there. The games
+// this runner is pointed at are built against the Windows runtime, so that is the one to match.
 static GMLReal particleRandomRange(GMLReal min, GMLReal max) {
     return min + particleRandom01() * (max - min);
 }
 
-// Triangle wave in [-1, 1] driven by the particle's phase counter. GameMaker does not document its
-// wiggle period; this approximates the oscillation without a sin() per property per particle per frame.
-static GMLReal particleWiggle(uint8_t phase) {
-    GMLReal t = (GMLReal) phase / 128.0; // 0..2
-    return (1.0 > t) ? (t * 2.0 - 1.0) : (3.0 - t * 2.0);
+// Triangle wave in [-1, 1] driven by the particle's age. Each wiggling property runs on its own
+// period and its own multiple of the particle's seed, so the four oscillations never line up and a
+// spray of particles does not pulse in unison. The periods below are GameMaker's.
+static GMLReal particleWiggle(int32_t age, int32_t seed, int32_t seedMultiplier, int32_t period) {
+    GMLReal t = (GMLReal) (4 * ((age + seedMultiplier * seed) % period)) / (GMLReal) period; // 0..4
+    if (t > 2.0) t = 4.0 - t;                                                                // fold to 0..2
+    return t - 1.0;
 }
+
+static GMLReal particleWiggleDirection(int32_t age, int32_t seed) { return particleWiggle(age, seed, 3, 24); }
+static GMLReal particleWiggleSpeed(int32_t age, int32_t seed)     { return particleWiggle(age, seed, 4, 20); }
+static GMLReal particleWiggleAngle(int32_t age, int32_t seed)     { return particleWiggle(age, seed, 2, 16); }
+static GMLReal particleWiggleSize(int32_t age, int32_t seed)      { return particleWiggle(age, seed, 1, 16); }
 
 // "number" follows the GML convention shared by part_emitter_stream and part_type_death: a positive
 // value is a literal count, a negative value is a 1-in-|number| chance of spawning a single particle.
-static int32_t particleResolveCount(int32_t number) {
-    if (number >= 0) return number;
-    // Negated as unsigned: -INT32_MIN does not fit back into int32_t.
-    uint32_t chance = (uint32_t) -(int64_t) number;
-    return (particleRandomBits() % chance == 0) ? 1 : 0;
+// Emitters take a real count, and GameMaker spends the fraction as a chance of one extra particle,
+// so part_emitter_stream(..., 0.5) emits on roughly every other step.
+static int32_t particleResolveCount(GMLReal number) {
+    if (0.0 > number) return (particleRandom01() * -number < 1.0) ? 1 : 0;
+
+    int32_t whole = (int32_t) number;
+    GMLReal fraction = number - (GMLReal) whole;
+    if (fraction > 0.0 && particleRandom01() <= fraction) whole++;
+    return whole;
 }
 
 // Uniform integer in [min, max] with both ends included, which is how GameMaker reads part_type_life.
-// Truncating a real drawn from [min, max) would never return max.
+// Truncating a real drawn from [min, max) would never return max. Reversed pairs sweep downward for
+// the same reason particleRandomRange() lets them.
 static int32_t particleRandomIntRange(int32_t min, int32_t max) {
     GMLReal span = (GMLReal) max - (GMLReal) min;
     span += (span >= 0.0) ? 1.0 : -1.0;
@@ -284,7 +301,7 @@ static bool particleSpawnAt(Runner* runner, ParticleSystem* system, int32_t type
     particle.lifeTotal = particleRandomIntRange(type->lifeMin, type->lifeMax);
     if (1 > particle.lifeTotal) particle.lifeTotal = 1;
     particle.life = particle.lifeTotal;
-    particle.phase = (uint8_t) (particleRandomBits() & 0xFFu);
+    particle.seed = (int32_t) (particleRandomBits() % 100000u);
 
     if (type->spriteRandom && type->sprite >= 0 && runner->dataWin != nullptr && (uint32_t) type->sprite < runner->dataWin->sprt.count) {
         uint32_t frames = runner->dataWin->sprt.sprites[type->sprite].textureCount;
@@ -350,7 +367,7 @@ static void particleEmitterSpawn(Runner* runner, ParticleSystem* system, Particl
     }
 }
 
-void Particles_emitterBurst(Runner* runner, int32_t systemId, int32_t emitterId, int32_t typeId, int32_t number) {
+void Particles_emitterBurst(Runner* runner, int32_t systemId, int32_t emitterId, int32_t typeId, GMLReal number) {
     ParticleSystem* system = Particles_systemGet(runner, systemId);
     ParticleEmitter* emitter = Particles_emitterGet(runner, systemId, emitterId);
     if (system == nullptr || emitter == nullptr) return;
@@ -371,20 +388,16 @@ void Particles_updateSystem(Runner* runner, int32_t systemId) {
     ParticleSystem* system = Particles_systemGet(runner, systemId);
     if (system == nullptr) return;
 
-    // Emitters stream first, so a particle spawned this step also moves this step (as in GameMaker).
-    int32_t emitterCount = (int32_t) arrlen(system->emitters);
-    repeat(emitterCount, i) {
-        ParticleEmitter* emitter = &system->emitters[i];
-        if (!emitter->used || 0 > emitter->streamType || emitter->streamNumber == 0) continue;
-        particleEmitterSpawn(runner, system, emitter, emitter->streamType, particleResolveCount(emitter->streamNumber));
-    }
+    // GameMaker ages a system, then moves it, and only then lets the emitters spawn into it. The
+    // order is worth preserving: it is what makes a streamed particle sit still for the step it is
+    // born on, while a death particle -- which joins between the two passes -- travels immediately.
 
-    // part_type_step and part_type_death spawns are collected and run after the movement pass:
-    // spawning mid-loop can realloc the array out from under the iteration, and the new particles
-    // must not be stepped on their own spawn frame. Only allocated when a type actually asks for it.
+    // Collected rather than spawned in place, because arrput() can move the array out from under the
+    // loop walking it. Only allocated when a type actually asks for step or death particles.
     typedef struct { int32_t typeId; GMLReal x, y; int32_t count; } PendingSpawn;
     PendingSpawn* pending = nullptr;
 
+    // Pass 1: age everything, note the spawns each particle's type asks for, bury what ran out.
     int32_t index = 0;
     while (index < (int32_t) arrlen(system->particles)) {
         Particle* particle = &system->particles[index];
@@ -397,13 +410,56 @@ void Particles_updateSystem(Runner* runner, int32_t systemId) {
             continue;
         }
 
-        GMLReal wiggle = particleWiggle(particle->phase);
-        GMLReal effectiveSpeed = particle->speed + type->speedWiggle * wiggle;
-        GMLReal effectiveDirection = particle->direction + type->dirWiggle * wiggle;
+        particle->life--;
+        bool died = (0 >= particle->life);
 
-        GMLReal radians = effectiveDirection * PARTICLE_DEG2RAD;
-        particle->x += effectiveSpeed * GMLReal_cos(radians);
-        particle->y -= effectiveSpeed * GMLReal_sin(radians); // GML's y axis grows downward
+        // A particle spawns its type's step particles every step it survives, and its death particles
+        // instead of them on the step it does not. The two never fire on the same step.
+        int32_t spawnType = died ? type->deathType : type->stepType;
+        int32_t spawnNumber = died ? type->deathNumber : type->stepNumber;
+        if (spawnType >= 0 && spawnNumber != 0) {
+            int32_t count = particleResolveCount((GMLReal) spawnNumber);
+            if (count > 0) {
+                PendingSpawn spawn;
+                spawn.typeId = spawnType;
+                spawn.x = particle->x;
+                spawn.y = particle->y;
+                spawn.count = count;
+                arrput(pending, spawn);
+            }
+        }
+
+        if (!died) {
+            index++;
+            continue;
+        }
+
+        // Swap-remove: order within a system does not affect the drawn result, every particle of a
+        // system is drawn in the same pass at the same depth.
+        system->particles[index] = arrlast(system->particles);
+        arrpop(system->particles);
+    }
+
+    // The collected spawns land before the movement pass, so they move on the step they are born.
+    repeat((int32_t) arrlen(pending), i) {
+        repeat(pending[i].count, n) {
+            if (!particleSpawnAt(runner, system, pending[i].typeId, pending[i].x, pending[i].y, 0xFFFFFFu, false)) break;
+        }
+    }
+    arrfree(pending);
+
+    // Pass 2: increments, then gravity, then the move. The increment lands before the particle
+    // travels, so its very first step already runs at (speed + speed increment).
+    int32_t particleCount = (int32_t) arrlen(system->particles);
+    repeat(particleCount, i) {
+        Particle* particle = &system->particles[i];
+        ParticleType* type = Particles_typeGet(runner, particle->typeId);
+        if (type == nullptr) continue;
+
+        particle->speed += type->speedIncr;
+        if (0.0 > particle->speed) particle->speed = 0.0; // GameMaker never lets a particle reverse
+        particle->direction += type->dirIncr;
+        particle->angle += type->angIncr;
 
         if (type->gravityAmount != 0.0) {
             // Gravity folds into the velocity vector permanently, so later speed/direction increments
@@ -417,57 +473,27 @@ void Particles_updateSystem(Runner* runner, int32_t systemId) {
                 particle->direction = GMLReal_atan2(-vspeed, hspeed) / PARTICLE_DEG2RAD;
         }
 
-        particle->speed += type->speedIncr;
-        if (0.0 > particle->speed) particle->speed = 0.0; // GameMaker never lets a particle reverse
-        particle->direction += type->dirIncr;
+        int32_t age = particle->lifeTotal - particle->life;
+        GMLReal effectiveSpeed = particle->speed + type->speedWiggle * particleWiggleSpeed(age, particle->seed);
+        GMLReal effectiveDirection = particle->direction + type->dirWiggle * particleWiggleDirection(age, particle->seed);
+
+        GMLReal radians = effectiveDirection * PARTICLE_DEG2RAD;
+        particle->x += effectiveSpeed * GMLReal_cos(radians);
+        particle->y -= effectiveSpeed * GMLReal_sin(radians); // GML's y axis grows downward
+
+        // GameMaker's third pass, less the colour and alpha curves: those are functions of the
+        // particle's age alone, so they are evaluated at draw time rather than stored per particle.
         particle->size += type->sizeIncr;
         if (0.0 > particle->size) particle->size = 0.0;
-        particle->angle += type->angIncr;
-
-        particle->phase = (uint8_t) ((particle->phase + 8u) & 0xFFu);
-        particle->life--;
-
-        if (type->stepType >= 0 && type->stepNumber != 0) {
-            int32_t count = particleResolveCount(type->stepNumber);
-            if (count > 0) {
-                PendingSpawn spawn;
-                spawn.typeId = type->stepType;
-                spawn.x = particle->x;
-                spawn.y = particle->y;
-                spawn.count = count;
-                arrput(pending, spawn);
-            }
-        }
-
-        if (particle->life > 0) {
-            index++;
-            continue;
-        }
-
-        if (type->deathType >= 0 && type->deathNumber != 0) {
-            int32_t count = particleResolveCount(type->deathNumber);
-            if (count > 0) {
-                PendingSpawn spawn;
-                spawn.typeId = type->deathType;
-                spawn.x = particle->x;
-                spawn.y = particle->y;
-                spawn.count = count;
-                arrput(pending, spawn);
-            }
-        }
-
-        // Swap-remove: order within a system does not affect the drawn result, every particle of a
-        // system is drawn in the same pass at the same depth.
-        system->particles[index] = arrlast(system->particles);
-        arrpop(system->particles);
     }
 
-    repeat((int32_t) arrlen(pending), i) {
-        repeat(pending[i].count, n) {
-            if (!particleSpawnAt(runner, system, pending[i].typeId, pending[i].x, pending[i].y, 0xFFFFFFu, false)) break;
-        }
+    // Emitters stream last, into a system where everything already alive has finished moving.
+    int32_t emitterCount = (int32_t) arrlen(system->emitters);
+    repeat(emitterCount, i) {
+        ParticleEmitter* emitter = &system->emitters[i];
+        if (!emitter->used || 0 > emitter->streamType || emitter->streamNumber == 0.0) continue;
+        particleEmitterSpawn(runner, system, emitter, emitter->streamType, particleResolveCount(emitter->streamNumber));
     }
-    arrfree(pending);
 }
 
 void Particles_updateAutomatic(Runner* runner) {
@@ -542,12 +568,13 @@ void Particles_drawSystem(Runner* runner, int32_t systemId) {
         ParticleType* type = Particles_typeGet(runner, particle->typeId);
         if (type == nullptr || 0 > type->sprite) continue;
 
-        GMLReal ageFraction = 1.0 - ((GMLReal) particle->life / (GMLReal) particle->lifeTotal);
+        int32_t age = particle->lifeTotal - particle->life;
+        GMLReal ageFraction = (GMLReal) age / (GMLReal) particle->lifeTotal;
         GMLReal alpha = particleAlphaAt(type, ageFraction);
         if (0.0 >= alpha) continue;
         if (alpha > 1.0) alpha = 1.0;
 
-        GMLReal size = particle->size + type->sizeWiggle * particleWiggle(particle->phase);
+        GMLReal size = particle->size + type->sizeWiggle * particleWiggleSize(age, particle->seed);
         if (0.0 >= size) continue;
 
         int32_t subimg = particle->subimgBase;
@@ -558,7 +585,7 @@ void Particles_drawSystem(Runner* runner, int32_t systemId) {
                                 ? runner->dataWin->sprt.sprites[type->sprite].textureCount : 0;
                 if (frames > 0) subimg += (int32_t) (ageFraction * (GMLReal) frames);
             } else {
-                subimg += particle->lifeTotal - particle->life;
+                subimg += age;
             }
         }
 
@@ -582,7 +609,7 @@ void Particles_drawSystem(Runner* runner, int32_t systemId) {
 
         // A relative orientation is measured from the direction the particle is travelling, so a
         // sprite drawn nose-first keeps pointing along its arc as gravity bends it.
-        GMLReal angle = particle->angle + type->angWiggle * particleWiggle(particle->phase);
+        GMLReal angle = particle->angle + type->angWiggle * particleWiggleAngle(age, particle->seed);
         if (type->angRelative) angle += particle->direction;
 
         Renderer_drawSpriteExt(renderer, type->sprite, subimg,

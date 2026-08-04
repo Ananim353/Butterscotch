@@ -86,7 +86,7 @@ typedef struct {
     int32_t subimgBase; // starting subimage
     uint32_t colour;    // set by part_particles_create_colour; overrides the type's colour curve
     bool colourFixed;   // true when "colour" above is in force
-    uint8_t phase;      // wiggle phase, advanced every step
+    int32_t seed;       // per-particle random; phase-shifts this particle's wiggle oscillations
 } Particle;
 
 typedef struct {
@@ -95,7 +95,9 @@ typedef struct {
     int32_t shape;
     int32_t distribution;
     int32_t streamType;   // type id streamed every step, -1 when the emitter is idle
-    int32_t streamNumber; // particles per step; negative means a 1-in-|n| chance
+    // Particles per step. Negative means a 1-in-|n| chance; a fraction is a chance of one more, so
+    // an emitter streaming 0.5 spawns on roughly every other step.
+    GMLReal streamNumber;
 } ParticleEmitter;
 
 typedef struct {
@@ -140,10 +142,12 @@ int32_t Particles_emitterCreate(Runner* runner, int32_t systemId);
 ParticleEmitter* Particles_emitterGet(Runner* runner, int32_t systemId, int32_t emitterId);
 void Particles_emitterDestroy(Runner* runner, int32_t systemId, int32_t emitterId);
 void Particles_emitterDestroyAll(Runner* runner, int32_t systemId);
-void Particles_emitterBurst(Runner* runner, int32_t systemId, int32_t emitterId, int32_t typeId, int32_t number);
+void Particles_emitterBurst(Runner* runner, int32_t systemId, int32_t emitterId, int32_t typeId, GMLReal number);
 
 // ===[ Frame hooks ]===
-// Steps one system: emitters stream, particles move and age, dead particles run their death spawn.
+// Steps one system: particles age and run their death spawn, then everything alive moves, and only
+// then do the emitters stream. That order is GameMaker's, and it is why a streamed particle stands
+// still on the step it is born.
 void Particles_updateSystem(Runner* runner, int32_t systemId);
 // Steps every system with automaticUpdate set. Called once at the end of Runner_step.
 void Particles_updateAutomatic(Runner* runner);

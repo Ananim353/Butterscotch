@@ -16786,12 +16786,14 @@ static RValue builtin_part_emitter_stream(VMContext* ctx, RValue* args, MAYBE_UN
     ParticleEmitter* emitter = Particles_emitterGet(ctx->runner, RValue_toInt32(args[0]), RValue_toInt32(args[1]));
     if (emitter == nullptr) return RValue_makeUndefined();
     emitter->streamType = RValue_toInt32(args[2]);
-    emitter->streamNumber = RValue_toInt32(args[3]);
+    // Kept as a real: GameMaker spends the fractional part as a chance of one extra particle, which
+    // is how a game asks an emitter for fewer than one particle per step.
+    emitter->streamNumber = RValue_toReal(args[3]);
     return RValue_makeUndefined();
 }
 
 static RValue builtin_part_emitter_burst(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
-    Particles_emitterBurst(ctx->runner, RValue_toInt32(args[0]), RValue_toInt32(args[1]), RValue_toInt32(args[2]), RValue_toInt32(args[3]));
+    Particles_emitterBurst(ctx->runner, RValue_toInt32(args[0]), RValue_toInt32(args[1]), RValue_toInt32(args[2]), RValue_toReal(args[3]));
     return RValue_makeUndefined();
 }
 

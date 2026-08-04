@@ -31,16 +31,18 @@ static GMLReal particleRandom01(void) {
     return (GMLReal) (particleRandomBits() >> 8) / (GMLReal) 0x01000000u;
 }
 
-// Uniform between the two bounds. Deliberately NOT normalised to (min <= max): GameMaker computes
-// "min + random * (max - min)" and lets a reversed pair sweep downward, which games rely on.
-// DELTARUNE Chapter 5 calls part_type_direction with (-1, -165), (-45, -90) and (-40, -90); each is
-// a fan that collapses into a single direction the moment the ends are clamped.
+// Uniform between the two bounds, and NOT normalised to (min <= max): GameMaker gives up on a range
+// that is not positive rather than swapping the ends, so part_type_direction(-45, -90) sprays along
+// a constant -45 instead of fanning down to -90. That is what MyRandom() does in the HTML5 runtime,
+// and the particle editor's preview agrees when gravity, direction increment and wiggle are zeroed.
 //
-// Worth spelling out because the HTML5 runtime disagrees: its MyRandom() returns the low bound
-// whenever (max - min) <= 0, so those three sprays would come out as straight jets there. The games
-// this runner is pointed at are built against the Windows runtime, so that is the one to match.
+// Two effects in DELTARUNE Chapter 5 lean on it -- obj_festival_particles at (-45, -90) and
+// obj_part_leaves at (-40, -90). Both are steady diagonal drifts, confetti and wind-blown leaves,
+// and neither applies gravity, so sweeping the range would spread them into a visible fan.
 static GMLReal particleRandomRange(GMLReal min, GMLReal max) {
-    return min + particleRandom01() * (max - min);
+    GMLReal range = max - min;
+    if (0.0 >= range) return min;
+    return min + particleRandom01() * range;
 }
 
 // Triangle wave in [-1, 1] driven by the particle's age. Each wiggling property runs on its own
@@ -71,11 +73,11 @@ static int32_t particleResolveCount(GMLReal number) {
 }
 
 // Uniform integer in [min, max] with both ends included, which is how GameMaker reads part_type_life.
-// Truncating a real drawn from [min, max) would never return max. Reversed pairs sweep downward for
-// the same reason particleRandomRange() lets them.
+// Truncating a real drawn from [min, max) would never return max. A reversed pair collapses to min,
+// the same way particleRandomRange() treats one.
 static int32_t particleRandomIntRange(int32_t min, int32_t max) {
-    GMLReal span = (GMLReal) max - (GMLReal) min;
-    span += (span >= 0.0) ? 1.0 : -1.0;
+    if (min >= max) return min;
+    GMLReal span = (GMLReal) max - (GMLReal) min + 1.0;
     return min + (int32_t) (particleRandom01() * span);
 }
 

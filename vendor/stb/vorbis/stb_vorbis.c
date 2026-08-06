@@ -1046,6 +1046,24 @@ static int ilog(int32 n)
   #define M_PI  3.14159265358979323846264f  // from CRC
 #endif
 
+// PORT PATCH (PSP): the twiddle/window setup tables (compute_twiddle_factors /
+// compute_window) are the ENTIRE cost of stb_vorbis_open on this target: a flat
+// ~110ms per open, measured identical (+/-0.3%) across files spanning 3.7x in bytes
+// and 4.4x in duration, i.e. independent of the file and therefore not codebook work.
+// The cause is ~5184 calls to the DOUBLE sin/cos per open; the Allegrex FPU has no
+// hardware double (USE_FLOAT_REALS), so each is software-emulated at ~21us. M_PI here
+// is already a float literal and every result is cast straight back to float, so the
+// double precision is pure waste. cosf/sinf run on the hardware FPU (~0.2us) at <1 ULP
+// error in the float result — inaudible in a lossy decoder, and the desktop backends
+// keep the exact original double path (macro defaults to sin/cos), so only PSP changes.
+#ifdef STBV_FAST_SETUP_TRIG
+  #define STBV_COS(x) cosf(x)
+  #define STBV_SIN(x) sinf(x)
+#else
+  #define STBV_COS(x) cos(x)
+  #define STBV_SIN(x) sin(x)
+#endif
+
 // code length assigned to a value with no huffman encoding
 #define NO_CODE   255
 
@@ -1257,14 +1275,14 @@ static void compute_twiddle_factors(int n, float *A, float *B, float *C)
    int k,k2;
 
    for (k=k2=0; k < n4; ++k,k2+=2) {
-      A[k2  ] = (float)  cos(4*k*M_PI/n);
-      A[k2+1] = (float) -sin(4*k*M_PI/n);
-      B[k2  ] = (float)  cos((k2+1)*M_PI/n/2) * 0.5f;
-      B[k2+1] = (float)  sin((k2+1)*M_PI/n/2) * 0.5f;
+      A[k2  ] = (float)  STBV_COS(4*k*M_PI/n);
+      A[k2+1] = (float) -STBV_SIN(4*k*M_PI/n);
+      B[k2  ] = (float)  STBV_COS((k2+1)*M_PI/n/2) * 0.5f;
+      B[k2+1] = (float)  STBV_SIN((k2+1)*M_PI/n/2) * 0.5f;
    }
    for (k=k2=0; k < n8; ++k,k2+=2) {
-      C[k2  ] = (float)  cos(2*(k2+1)*M_PI/n);
-      C[k2+1] = (float) -sin(2*(k2+1)*M_PI/n);
+      C[k2  ] = (float)  STBV_COS(2*(k2+1)*M_PI/n);
+      C[k2+1] = (float) -STBV_SIN(2*(k2+1)*M_PI/n);
    }
 }
 
@@ -1272,7 +1290,14 @@ static void compute_window(int n, float *window)
 {
    int n2 = n >> 1, i;
    for (i=0; i < n2; ++i)
+#ifdef STBV_FAST_SETUP_TRIG
+      // Fully single-precision: the 0.5 literals are float too, so the argument math
+      // stays on the hardware FPU rather than software double. Value-identical to the
+      // double form to <1 ULP; the default #else path below is the verbatim original.
+      window[i] = sinf(0.5f * M_PI * square(sinf((i + 0.5f) / n2 * 0.5f * M_PI)));
+#else
       window[i] = (float) sin(0.5 * M_PI * square((float) sin((i - 0 + 0.5) / n2 * 0.5 * M_PI)));
+#endif
 }
 
 static void compute_bitreverse(int n, uint16 *rev)

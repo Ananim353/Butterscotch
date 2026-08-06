@@ -15,6 +15,139 @@
 
 #include "stb_ds.h"
 
+#ifdef PLATFORM_PSP
+#include <psptypes.h>
+#include <pspthreadman.h> // sceKernelGetSystemTimeLow
+#endif
+
+#ifdef ENABLE_VMPROF
+// TEMP VM-PROFILE (grass/maze draw-cost hunt): splits executeLoop cost into
+// interpreter work vs builtin-function work, and attributes builtin time per
+// function so we know WHICH optimization (dispatch, variable lookup, builtin
+// internals) to do first. Call counts are exact; builtin timing samples every
+// 16th call (sceKernelGetSystemTime* is a syscall — timing every draw_sprite in
+// the maze would distort the measurement by milliseconds per frame).
+#endif // ENABLE_VMPROF — reopened below, after the always-built per-frame profile
+
+#ifdef PLATFORM_PSP
+// ===[ Per-FRAME call profile (RunnerCFG "callprof=1") ]===
+// The window profile below (ENABLE_VMPROF) averages over 120 frames, which is the wrong shape for
+// a spike: a 150ms battle-entry frame disappears into the average of the two seconds around it.
+// This is the same idea as SPIKED's per-object top-3, one level down — top functions inside the
+// ONE frame that spiked, so "obj_encounterbasic:154000" can be resolved into what it called.
+//
+// A runtime flag rather than a build option on purpose: it has to be measurable on the very build
+// that is on the card, not on a separately-compiled one. Cost while off is a predictable branch
+// per call; while on, two clock reads per call.
+//
+// Both EXCLUSIVE and inclusive time are kept, and the ranking uses exclusive. Inclusive alone
+// only ever names the outermost caller: the first measuring run put instance_create_depth at
+// 156ms/22 calls, which reads as "creating an instance costs 7ms" when in truth most of it was
+// one script two levels down. Exclusive time also catches cost that is NOT a call at all --
+// array stores, variable lookups, the interpreter itself -- because it stays with the frame that
+// actually ran those instructions.
+bool g_bsCallProf = false;
+static uint32_t* g_cpUs = NULL;      // EXCLUSIVE us, indexed by funcIndex (ranking key)
+static uint32_t* g_cpIncl = NULL;    // inclusive us, same index
+static uint32_t* g_cpCalls = NULL;
+static uint32_t g_cpCount = 0;
+static uint32_t g_cpChildUs = 0;     // time the call currently running spent inside ITS callees
+static const DataWin* g_cpDw = NULL;
+
+static inline bool cpReady(VMContext* ctx) {
+    if (g_cpUs != NULL) return true;
+    g_cpCount = ctx->dataWin->func.functionCount;
+    if (g_cpCount == 0) return false;
+    g_cpUs = (uint32_t*) calloc(g_cpCount, sizeof(uint32_t));
+    g_cpIncl = (uint32_t*) calloc(g_cpCount, sizeof(uint32_t));
+    g_cpCalls = (uint32_t*) calloc(g_cpCount, sizeof(uint32_t));
+    g_cpDw = ctx->dataWin;
+    return g_cpUs != NULL && g_cpIncl != NULL && g_cpCalls != NULL;
+}
+
+// Wraps one timed call. Splits its own time from its callees' by handing each call a fresh child
+// accumulator and restoring the caller's on the way out.
+#define CP_TIMED(funcIndex, CALL_EXPR)                                              \
+    do {                                                                            \
+        uint32_t cpSaved = g_cpChildUs;                                             \
+        g_cpChildUs = 0;                                                            \
+        uint32_t cpT0 = sceKernelGetSystemTimeLow();                                \
+        CALL_EXPR;                                                                  \
+        uint32_t cpDt = sceKernelGetSystemTimeLow() - cpT0;                         \
+        uint32_t cpKids = g_cpChildUs;                                              \
+        g_cpUs[funcIndex] += (cpDt > cpKids) ? (cpDt - cpKids) : 0u;                \
+        g_cpIncl[funcIndex] += cpDt;                                                \
+        g_cpCalls[funcIndex]++;                                                     \
+        g_cpChildUs = cpSaved + cpDt;                                               \
+    } while (0)
+
+// Reads and RESETS the frame's table. Main calls this every frame and prints only on a spike,
+// exactly like the per-object top-3.
+int VM_debugFrameCallTop(const char** names, uint32_t* calls, uint32_t* us, uint32_t* inclUs, int max) {
+    int filled = 0;
+    if (g_cpUs == NULL || g_cpDw == NULL) return 0;
+    for (; filled < max; filled++) {
+        uint32_t best = 0, bestUs = 0;
+        for (uint32_t i = 0; i < g_cpCount; i++)
+            if (g_cpUs[i] > bestUs) { bestUs = g_cpUs[i]; best = i; }
+        if (bestUs == 0) break;
+        const char* n = g_cpDw->func.functions[best].name;
+        names[filled] = (n != NULL) ? n : "?";
+        calls[filled] = g_cpCalls[best];
+        us[filled] = bestUs;
+        inclUs[filled] = g_cpIncl[best];
+        g_cpUs[best] = 0; // consumed
+    }
+    memset(g_cpUs, 0, (size_t) g_cpCount * sizeof(uint32_t));
+    memset(g_cpIncl, 0, (size_t) g_cpCount * sizeof(uint32_t));
+    memset(g_cpCalls, 0, (size_t) g_cpCount * sizeof(uint32_t));
+    g_cpChildUs = 0; // a frame boundary is not inside any call
+    return filled;
+}
+#endif // PLATFORM_PSP (per-frame call profile)
+
+#ifdef ENABLE_VMPROF
+typedef struct { uint32_t calls; uint32_t sampledUs; } VmProfFuncStat;
+static VmProfFuncStat* g_vmProfFunc = NULL; // indexed by funcIndex
+static uint32_t g_vmProfFuncCount = 0;
+static const DataWin* g_vmProfDw = NULL;    // for funcIndex -> name at dump time
+static uint64_t g_vmProfOps = 0;            // VM instructions executed
+static uint32_t g_vmProfBiCalls = 0;        // builtin calls (exact)
+static uint32_t g_vmProfBiSampled = 0;      // how many of them were timed
+static uint32_t g_vmProfBiSampledUs = 0;    // us across the timed ones
+static uint32_t g_vmProfCallNo = 0;         // sampling gate
+uint64_t g_bsVarLookups = 0;                // selfVars hashmap hits (instance.h)
+
+// Reads + resets. Fills up to topN (name,calls,estUs) entries sorted by sampled
+// time; returns how many were filled. estUs scales the sampled time back up.
+int VM_debugProfRead(uint64_t* ops, uint32_t* biCalls, uint32_t* biEstUs, uint32_t* varLookups,
+                     const char** topName, uint32_t* topCalls, uint32_t* topEstUs, int topN) {
+    *ops = g_vmProfOps;
+    *biCalls = g_vmProfBiCalls;
+    float scale = g_vmProfBiSampled > 0 ? (float) g_vmProfBiCalls / (float) g_vmProfBiSampled : 0.0f;
+    *biEstUs = (uint32_t) ((float) g_vmProfBiSampledUs * scale);
+    *varLookups = (uint32_t) g_bsVarLookups;
+    int filled = 0;
+    if (g_vmProfFunc && g_vmProfDw) {
+        for (; filled < topN; filled++) {
+            uint32_t best = 0, bestUs = 0;
+            for (uint32_t i = 0; i < g_vmProfFuncCount; i++) {
+                if (g_vmProfFunc[i].sampledUs > bestUs) { bestUs = g_vmProfFunc[i].sampledUs; best = i; }
+            }
+            if (bestUs == 0) break;
+            topName[filled] = g_vmProfDw->func.functions[best].name;
+            topCalls[filled] = g_vmProfFunc[best].calls;
+            topEstUs[filled] = (uint32_t) ((float) bestUs * scale);
+            g_vmProfFunc[best].sampledUs = 0; // consumed (also acts as the reset)
+        }
+        memset(g_vmProfFunc, 0, (size_t) g_vmProfFuncCount * sizeof(VmProfFuncStat));
+    }
+    g_vmProfOps = 0; g_vmProfBiCalls = 0; g_vmProfBiSampled = 0; g_vmProfBiSampledUs = 0;
+    g_bsVarLookups = 0;
+    return filled;
+}
+#endif
+
 // ===[ Stack Operations ]===
 
 #ifdef ENABLE_VM_TRACING
@@ -122,6 +255,23 @@ static uint8_t instrType1(uint32_t instr) {
 
 static uint8_t instrType2(uint32_t instr) {
     return (instr >> 20) & 0xF;
+}
+
+// GameMaker's numeric binary ops (add/sub/mul/div/mod/rem and bitwise) declare their
+// result on the stack with the WIDER of the two operand types (numeric promotion). The
+// byte-count model used by Dup/BREAK (bytesToSlotCount) relies on each slot's gmlStackType
+// matching the width the compiler assigned to it. Tagging the result with instrType2 alone
+// under-sizes it whenever type1 is wider than type2 — e.g. Add.v.i (Variable + int): the
+// result occupies a Variable-width (16B) slot, not an int (4B). When such a result feeds a
+// `.v` dup-swap over a method-call argument list with no intervening Conv (as in show_menu's
+// `option.init(id, label, names, flag, 170 + ja_offset)`), the under-sized tag makes
+// bytesToSlotCount overshoot the byte boundary and abort at `require(remaining == 0)`.
+// gmlStackType is only ever read by bytesToSlotCount, so widening to the correct type can
+// only make byte walks consistent — it never changes a value's runtime interpretation.
+static uint8_t binaryResultType(uint32_t instr) {
+    uint8_t t1 = instrType1(instr);
+    uint8_t t2 = instrType2(instr);
+    return (gmlTypeNativeSize(t1) > gmlTypeNativeSize(t2)) ? t1 : t2;
 }
 
 static int16_t instrInstanceType(uint32_t instr) {
@@ -262,6 +412,8 @@ static GMLArray* VM_arraySetWithCoW(VMContext* ctx, RValue* slot, int32_t index,
     require(slot != nullptr);
     requireMessageFormatted(__FILE__, __LINE__, index >= 0, "Trying to write to an array using a negative index! Index: %d", index);
 
+    RValue writeVal = RValue_makeIndependent(val);
+
     void* intendedOwner;
 #if IS_WAD17_OR_HIGHER_ENABLED
     intendedOwner = IS_WAD17_OR_HIGHER(ctx) ? ctx->currentArrayOwner : (void*) slot;
@@ -277,7 +429,7 @@ static GMLArray* VM_arraySetWithCoW(VMContext* ctx, RValue* slot, int32_t index,
         fresh->owner = intendedOwner;
         *slot = RValue_makeArray(fresh);
         GMLArray_growTo(fresh, index + 1);
-        GMLArray_set(fresh, index, val);
+        RValue_writeIntoSlotStealingOwnershipOrCopying(GMLArray_slot(fresh, index), writeVal);
         return fresh;
     }
 
@@ -299,7 +451,8 @@ static GMLArray* VM_arraySetWithCoW(VMContext* ctx, RValue* slot, int32_t index,
     }
 
     // Case 3: Write!
-    GMLArray_set(arr, index, val);
+    GMLArray_growTo(arr, index + 1);
+    RValue_writeIntoSlotStealingOwnershipOrCopying(GMLArray_slot(arr, index), writeVal);
     return arr;
 }
 
@@ -308,11 +461,29 @@ int32_t VM_getOrAllocateVarID(VMContext* ctx, const char* name) {
     ptrdiff_t slot = shgeti(ctx->varNameMap, name);
     if (slot >= 0) return ctx->varNameMap[slot].value;
     int32_t id = ctx->nextDynamicVarID++;
-    shput(ctx->varNameMap, safeStrdup(name), id);
+    char* owned = safeStrdup(name);
+    shput(ctx->varNameMap, owned, id);
+    // Mirror into the reverse index. IDs come out of a counter, so they land densely and the
+    // array stays tight; a gap (a preassigned ID from elsewhere) is filled with NULL and the
+    // lookup falls back to the scan for it.
+    if (id >= 0) {
+        while ((ptrdiff_t) arrlen(ctx->varNameById) <= (ptrdiff_t) id) arrput(ctx->varNameById, nullptr);
+        ctx->varNameById[id] = owned;
+    }
     return id;
 }
 
+// Reverse lookup, O(1). It used to walk the ENTIRE varNameMap — and not even break on a match —
+// which is thousands of entries in ch5. struct_get_names calls it once per field, scr_copy_struct
+// calls struct_get_names per particle, and obj_petal_burst copies ten particles in one Step: the
+// console measured that single event at 341ms (SPIKED st: obj_petal_burst:341116), which is the
+// battle-entry freeze. The scan is kept only as the fallback for an ID that never came through
+// VM_getOrAllocateVarID.
 char* VM_getVariableNameByVarId(VMContext* ctx, int32_t varId) {
+    if (varId >= 0 && (ptrdiff_t) varId < (ptrdiff_t) arrlen(ctx->varNameById)) {
+        char* hit = ctx->varNameById[varId];
+        if (hit != nullptr) return hit;
+    }
     char* name = nullptr;
     repeat(shlen(ctx->varNameMap), j) {
         if (ctx->varNameMap[j].value == varId) {
@@ -450,6 +621,32 @@ static Variable* resolveVarDef(VMContext* ctx, uint32_t varRef) {
     return varDef;
 }
 
+// ===[ Per-call frame arena ]===
+// localVars/scriptArgs frames live in a LIFO arena: alloc bumps the top and the
+// caller restores its saved top after freeing the frame's RValue contents.
+// resolveLocalSlot may swap a frame's localVars to a heap block mid-call (BC17
+// slot growth); pointer-range checks route each block to the right release path,
+// and an abandoned arena block is simply reclaimed by the caller's top restore.
+static inline bool vmFrameIsArenaPtr(VMContext* ctx, RValue* p) {
+    return p >= ctx->frameArena && p < ctx->frameArena + ctx->frameArenaCap;
+}
+
+static RValue* vmFrameAlloc(VMContext* ctx, uint32_t count) {
+    if (ctx->frameArena != nullptr && ctx->frameArenaTop + count <= ctx->frameArenaCap) {
+        RValue* p = ctx->frameArena + ctx->frameArenaTop;
+        ctx->frameArenaTop += count;
+        if (count > 0) memset(p, 0, count * sizeof(RValue)); // zero = RVALUE_UNDEFINED
+        return p;
+    }
+    return (RValue *)safeCalloc(count, sizeof(RValue));
+}
+
+// Frees the BLOCK only (contents must already be RValue_free'd). Arena blocks
+// are reclaimed by the caller's frameArenaTop restore, not here.
+static inline void vmFrameReleaseBlock(VMContext* ctx, RValue* p) {
+    if (p != nullptr && !vmFrameIsArenaPtr(ctx, p)) free(p);
+}
+
 // Maps a GML local's varID to its slot position in the current code's localVars[] array.
 //
 // BC15/16: varIDs for locals are already sequential slot indices (0, 1, 2, ...), so we return the varID unchanged.
@@ -469,7 +666,7 @@ static uint32_t resolveLocalSlot(VMContext* ctx, int32_t varID) {
     if (slot >= ctx->localVarCount) {
         RValue* resizedLocalVars = (RValue *)safeCalloc(slot + 1, sizeof(RValue));
         memcpy(resizedLocalVars, ctx->localVars, sizeof(RValue) * ctx->localVarCount);
-        free(ctx->localVars);
+        vmFrameReleaseBlock(ctx, ctx->localVars);
         ctx->localVars = resizedLocalVars;
         ctx->localVarCount = slot + 1;
     }
@@ -645,7 +842,7 @@ void VM_writeToScriptArgs(VMContext* ctx, int32_t writeIndex, RValue val) {
         RValue* newScriptArgs = (RValue *)safeCalloc(writeIndex + 1, sizeof(RValue));
         if (ctx->scriptArgCount > 0) {
             memcpy(newScriptArgs, ctx->scriptArgs, ctx->scriptArgCount * sizeof(RValue));
-            free(ctx->scriptArgs);
+            vmFrameReleaseBlock(ctx, ctx->scriptArgs);
         }
         ctx->scriptArgs = newScriptArgs;
         ctx->scriptArgCount = writeIndex + 1;
@@ -1544,7 +1741,7 @@ static void handleDiv(VMContext* ctx, uint32_t instr) {
     GMLReal result = RValue_toReal(a) / divisor;
     RValue_free(&a);
     RValue_free(&b);
-    stackPushTyped(ctx, RValue_makeReal(result), instrType2(instr));
+    stackPushTyped(ctx, RValue_makeReal(result), binaryResultType(instr));
 }
 
 static void handleRem(VMContext* ctx, uint32_t instr) {
@@ -1555,7 +1752,7 @@ static void handleRem(VMContext* ctx, uint32_t instr) {
     int64_t result = RValue_toInt64(a) / divisor;
     RValue_free(&a);
     RValue_free(&b);
-    stackPushTyped(ctx, RValue_makeInt64(result), instrType2(instr));
+    stackPushTyped(ctx, RValue_makeInt64(result), binaryResultType(instr));
 }
 
 static void handleMod(VMContext* ctx, uint32_t instr) {
@@ -1566,14 +1763,14 @@ static void handleMod(VMContext* ctx, uint32_t instr) {
     GMLReal result = GMLReal_fmod(RValue_toReal(a), divisor);
     RValue_free(&a);
     RValue_free(&b);
-    stackPushTyped(ctx, RValue_makeReal(result), instrType2(instr));
+    stackPushTyped(ctx, RValue_makeReal(result), binaryResultType(instr));
 }
 
 #define SIMPLE_BYTECODE_BITWISE_OPERATION(op) \
     int32_t b = stackPopInt32(ctx); \
     int32_t a = stackPopInt32(ctx); \
     int32_t result = a op b; \
-    stackPushTyped(ctx, RValue_makeInt32(result), instrType2(instr))
+    stackPushTyped(ctx, RValue_makeInt32(result), binaryResultType(instr))
 
 static void handleAnd(VMContext* ctx, uint32_t instr) {
     SIMPLE_BYTECODE_BITWISE_OPERATION(&);
@@ -1868,7 +2065,11 @@ static void handleDup(VMContext* ctx, uint32_t instr) {
         int32_t totalSlots = topSlots + bottomSlots;
         int32_t baseIdx = ctx->stack.top - totalSlots;
 
-        // Save top group to temp
+        // Save top group to temp. topNativeCount is bits 0-10 of the operand, so a swap can ask
+        // for up to 2047 slots, and bytesToSlotCount bounds the result only by stack depth --
+        // nothing kept it under 32. A bytecode-controlled write past a C-stack array, inside the
+        // handler of the very instruction whose desync already produced one traceless exit.
+        require(topSlots <= 32);
         RValue temp[32];
         for (int32_t i = 0; topSlots > i; i++) {
             temp[i] = ctx->stack.slots[ctx->stack.top - topSlots + i];
@@ -1925,15 +2126,27 @@ static void handleDup(VMContext* ctx, uint32_t instr) {
 
 // ===[ Function Call Handler ]===
 
+// Args live on the C stack for typical calls: a heap calloc+free pair per GML function
+// call (~25k/window in the maze) was measurable interpreter overhead. Callees never
+// keep the array (builtins use it transiently, VM_callCodeIndex copies what it needs).
+#define VM_ARGS_STACK_MAX 12
+
 static void handleCall(VMContext* ctx, uint32_t instr, const uint8_t* extraData) {
     int32_t argCount = instr & 0xFFFF;
     uint32_t funcIndex = resolveFuncOperand(extraData);
     require(ctx->dataWin->func.functionCount > funcIndex);
 
     // Pop arguments from stack (args pushed right-to-left, so first arg is on top)
+    RValue argsBuf[VM_ARGS_STACK_MAX];
     RValue* args = nullptr;
+    bool argsOnHeap = false;
     if (argCount > 0) {
-        args = (RValue *)safeCalloc(argCount, sizeof(RValue));
+        if (argCount <= VM_ARGS_STACK_MAX) {
+            args = argsBuf;
+        } else {
+            args = (RValue *)safeCalloc(argCount, sizeof(RValue));
+            argsOnHeap = true;
+        }
         repeat(argCount, i) {
             args[i] = stackPop(ctx);
         }
@@ -1970,13 +2183,41 @@ static void handleCall(VMContext* ctx, uint32_t instr, const uint8_t* extraData)
     // Fast path: cached builtin function pointer
     if (cache->builtin != nullptr) {
         BuiltinFunc builtin = (BuiltinFunc) cache->builtin;
-        RValue result = builtin(ctx, args, argCount);
+#ifdef ENABLE_VMPROF
+        // TEMP VM-PROFILE: exact call counts, sampled (1/16) timing per funcIndex.
+        if (g_vmProfFunc == NULL) {
+            g_vmProfFuncCount = ctx->dataWin->func.functionCount;
+            g_vmProfFunc = (VmProfFuncStat*) calloc(g_vmProfFuncCount, sizeof(VmProfFuncStat));
+            g_vmProfDw = ctx->dataWin;
+        }
+        g_vmProfBiCalls++;
+        if (g_vmProfFunc && funcIndex < g_vmProfFuncCount) g_vmProfFunc[funcIndex].calls++;
+        RValue result;
+        if ((++g_vmProfCallNo & 15u) == 0) {
+            uint32_t t0 = sceKernelGetSystemTimeLow();
+            result = builtin(ctx, args, argCount);
+            uint32_t dt = sceKernelGetSystemTimeLow() - t0;
+            g_vmProfBiSampled++;
+            g_vmProfBiSampledUs += dt;
+            if (g_vmProfFunc && funcIndex < g_vmProfFuncCount) g_vmProfFunc[funcIndex].sampledUs += dt;
+        } else {
+            result = builtin(ctx, args, argCount);
+        }
+#else
+        RValue result;
+#ifdef PLATFORM_PSP
+        if (g_bsCallProf && cpReady(ctx) && funcIndex < g_cpCount) {
+            CP_TIMED(funcIndex, result = builtin(ctx, args, argCount));
+        } else
+#endif
+        result = builtin(ctx, args, argCount);
+#endif
         // Free arguments
         if (args != nullptr) {
             repeat(argCount, i) {
                 RValue_free(&args[i]);
             }
-            free(args);
+            if (argsOnHeap) free(args);
         }
 
 #ifdef ENABLE_VM_TRACING
@@ -1994,7 +2235,15 @@ static void handleCall(VMContext* ctx, uint32_t instr, const uint8_t* extraData)
 
     // Fast path: cached script code index
     if (cache->scriptCodeIndex >= 0) {
-        RValue result = VM_callCodeIndex(ctx, cache->scriptCodeIndex, args, argCount);
+        RValue result;
+#ifdef PLATFORM_PSP
+        // Scripts share the table with builtins: both are keyed by funcIndex, so one top-3 covers
+        // "which GML script" and "which engine function" without having to guess which it will be.
+        if (g_bsCallProf && cpReady(ctx) && funcIndex < g_cpCount) {
+            CP_TIMED(funcIndex, result = VM_callCodeIndex(ctx, cache->scriptCodeIndex, args, argCount));
+        } else
+#endif
+        result = VM_callCodeIndex(ctx, cache->scriptCodeIndex, args, argCount);
 
 #ifdef ENABLE_VM_TRACING
         if (functionIsBeingTraced) {
@@ -2010,7 +2259,7 @@ static void handleCall(VMContext* ctx, uint32_t instr, const uint8_t* extraData)
             repeat(argCount, i) {
                 RValue_free(&args[i]);
             }
-            free(args);
+            if (argsOnHeap) free(args);
         }
 
         stackPushTyped(ctx, result, GML_TYPE_VARIABLE);
@@ -2018,6 +2267,26 @@ static void handleCall(VMContext* ctx, uint32_t instr, const uint8_t* extraData)
     }
 
     // Slow path: unknown function (not cached as builtin or script)
+#ifdef PLATFORM_PSP
+    { // TEMP DIAG (console freeze hunt): stub logs are off on PSP, so mark this path.
+        // Deduped per funcIndex: Pizza Tower's FMOD calls hit this thousands of times/frame,
+        // and logging each one floods the trace ring and pins the card at 99%.
+        extern void BsDiag_trace(const char* fmt, int a, int b);
+        static unsigned char unkLogged[16384];
+        if (funcIndex >= 0 && funcIndex < 16384 && !unkLogged[funcIndex]) {
+            unkLogged[funcIndex] = 1;
+            // The NAME, not just the index. An unresolved call returns undefined in silence, so
+            // its only symptom is a missing effect somewhere on screen — "no particles from the
+            // prism bloom" was traced back to this line by hand, matching index ranges against
+            // the decompilation. The name makes that a lookup instead of an inference.
+            const char* fn = (ctx->dataWin != nullptr && ctx->dataWin->func.functionCount > (uint32_t) funcIndex)
+                           ? ctx->dataWin->func.functions[funcIndex].name : nullptr;
+            char dl[128];
+            snprintf(dl, sizeof(dl), "vm unk f=%d %s", (int) funcIndex, fn ? fn : "?");
+            BsDiag_trace(dl, 0, 0);
+        }
+    }
+#endif
 #ifdef ENABLE_VM_STUB_LOGS
     const char* unknownFuncName = ctx->dataWin->func.functions[funcIndex].name;
 
@@ -2038,7 +2307,7 @@ static void handleCall(VMContext* ctx, uint32_t instr, const uint8_t* extraData)
         repeat(argCount, i) {
             RValue_free(&args[i]);
         }
-        free(args);
+        if (argsOnHeap) free(args);
     }
 
 #ifdef ENABLE_VM_TRACING
@@ -2060,9 +2329,16 @@ static void handleCallV(VMContext* ctx, uint32_t instr) {
     RValue function = stackPop(ctx);
     RValue instance = stackPop(ctx);
 
+    RValue argsBuf[VM_ARGS_STACK_MAX]; // same heap-free fast path as handleCall
     RValue* args = nullptr;
+    bool argsOnHeap = false;
     if (argCount > 0) {
-        args = (RValue *)safeCalloc(argCount, sizeof(RValue));
+        if (argCount <= VM_ARGS_STACK_MAX) {
+            args = argsBuf;
+        } else {
+            args = (RValue *)safeCalloc(argCount, sizeof(RValue));
+            argsOnHeap = true;
+        }
         repeat(argCount, i) {
             args[i] = stackPop(ctx);
         }
@@ -2138,7 +2414,7 @@ static void handleCallV(VMContext* ctx, uint32_t instr) {
         repeat(argCount, i) {
             RValue_free(&args[i]);
         }
-        free(args);
+        if (argsOnHeap) free(args);
     }
 
     stackPushTyped(ctx, result, GML_TYPE_VARIABLE);
@@ -2178,6 +2454,10 @@ static void switchToInstance(VMContext* ctx, Instance* inst) {
     ctx->currentInstance = inst;
 }
 
+// RunnerCFG "withstruct_off=1": go back to reading a with() target as an integer only, for an
+// A/B. See handlePushEnv for what that silently broke.
+bool g_vmWithStructEnabled = true;
+
 // Restores VM context from an EnvFrame's saved fields.
 static void restoreEnvContext(VMContext* ctx, EnvFrame* frame) {
     ctx->currentInstance = frame->savedInstance;
@@ -2189,22 +2469,71 @@ static void handlePushEnv(VMContext* ctx, uint32_t instr, uint32_t instrAddr) {
 
     // Pop target from stack
     int32_t target = stackPopInt32(ctx);
+    Instance* structTarget = nullptr;
     // BC17: -9 (INSTANCE_STACKTOP) means "pop again for the real target"
     if (IS_WAD17_OR_HIGHER(ctx) && target == INSTANCE_STACKTOP) {
-        target = resolveInstanceStackTop(ctx);
+        // GameMaker 2.3+ accepts a STRUCT here, not only an instance id or an object index.
+        // Read as an integer it came out as object index 0, whose instance list is empty, so
+        // the entire with-block was skipped in silence — the loop still paid for itself and
+        // drew nothing. Chapter 5's battle petals are exactly this shape: obj_petal_burst's
+        // Draw is one "with (particle_data[i]) draw_sprite_ext(...)" over an array of structs
+        // and nothing else, which is how it cost 2ms of Draw a frame with no petal on screen.
+        // Structs ARE Instances in this runtime, so the block simply runs on one. No incRef
+        // needed: a struct is only ever physically freed by the per-frame sweep, never by the
+        // decRef in this pop. RunnerCFG "withstruct_off=1" restores the integer-only read.
+        RValue tv = stackPop(ctx);
+        if (g_vmWithStructEnabled && tv.type == RVALUE_STRUCT && tv.structInst != nullptr) {
+            structTarget = tv.structInst;
+            // TEMP §2.118: remember WHO is iterating the struct. A particle draws with the
+            // struct as "self", so by the time draw_sprite_ext runs the owning object is gone
+            // from the context — and the probe that keyed on sprite id spent its whole budget
+            // on the room's ambient bush leaves, hiding whether obj_petal_burst draws at all.
+            {
+                extern const char* g_bsStructOwner;
+                Instance* owner = (Instance*) ctx->currentInstance;
+                g_bsStructOwner = (owner != nullptr && owner->objectIndex >= 0
+                                   && (uint32_t) owner->objectIndex < ctx->dataWin->objt.count)
+                                  ? ctx->dataWin->objt.objects[owner->objectIndex].name : "?";
+            }
+            static bool tracedWithStruct = false;
+            if (!tracedWithStruct) {
+                tracedWithStruct = true;
+                extern void BsDiag_trace(const char* fmt, int a, int b);
+                BsDiag_trace("vm with(struct) first hit", 0, 0);
+            }
+        } else {
+            target = RValue_toInt32(tv);
+        }
+        RValue_free(&tv);
     }
 
-    // Create env frame, save current context
-    EnvFrame* frame = (EnvFrame *)safeMalloc(sizeof(EnvFrame));
+    // Create env frame, save current context. Reuse a pooled frame when one is free
+    // (with-blocks are entered/exited constantly; the pool keeps the EnvFrame AND its
+    // instanceList backing buffer allocated across uses — see handlePopEnv/VM_free).
+    EnvFrame* frame = ctx->envFreeList;
+    if (frame != nullptr) {
+        ctx->envFreeList = frame->parent;
+        // instanceList kept its capacity from last use (emptied on release), so do NOT
+        // null it here — the arrput paths below reuse the existing buffer.
+    } else {
+        frame = (EnvFrame *)safeMalloc(sizeof(EnvFrame));
+        frame->instanceList = nullptr;
+    }
     frame->savedInstance = (Instance*) ctx->currentInstance;
     frame->savedOtherInstance = (Instance*) ctx->otherInstance;
-    frame->instanceList = nullptr;
     frame->currentIndex = 0;
     frame->parent = ctx->envStack;
     ctx->envStack = frame;
 
     // Inside a with-block, "other" refers to the instance that executed the with-statement
     ctx->otherInstance = (Instance*) ctx->currentInstance;
+
+    // A struct target is a single "instance": no list to iterate, PopEnv sees an empty
+    // instanceList and restores the caller exactly as it does for with(single instance).
+    if (structTarget != nullptr) {
+        switchToInstance(ctx, structTarget);
+        return;
+    }
 
     Runner* runner = (Runner*) ctx->runner;
 
@@ -2259,32 +2588,27 @@ static void handlePushEnv(VMContext* ctx, uint32_t instr, uint32_t instrAddr) {
             Instance** source = runner->instancesByObject[target];
             int32_t sourceCount = (int32_t) arrlen(source);
 
-            Instance** activeInstances = nullptr;
+            // Filter active instances straight into the frame's list — no throwaway
+            // temp array + second copy (this ran on every with(object), constantly).
             repeat(sourceCount, i) {
                 if (source[i]->active) {
-                    arrput(activeInstances, source[i]);
+                    arrput(frame->instanceList, source[i]);
                 }
             }
-
-            int32_t activeSourceCount = arrlen(activeInstances);
 
             // You may be thinking "wow this looks extremely dumb", well, THAT'S HOW GAMEMAKER HANDLES IT FOR SOME REASON
-            // GameMaker is *quirky* like that
-            if (activeSourceCount == 1) {
-                arrput(frame->instanceList, activeInstances[0]);
-            } else if (activeSourceCount == 2) {
-                // Iterate in forward order
-                arrput(frame->instanceList, activeInstances[0]);
-                arrput(frame->instanceList, activeInstances[1]);
-            } else {
-                // Iterate in reverse order
-                for (int32_t i = activeSourceCount - 1; i >= 0; i--) {
-                    Instance* inst = activeInstances[i];
-                    arrput(frame->instanceList, inst);
+            // GameMaker is *quirky* like that: it iterates a with(object) over >=3
+            // instances in REVERSE order (1 and 2 stay forward). Reversing the
+            // just-filled list in place reproduces the old "collect then arrput in
+            // reverse" byte-for-byte, without the extra allocation + copy.
+            int32_t activeSourceCount = (int32_t) arrlen(frame->instanceList);
+            if (activeSourceCount >= 3) {
+                for (int32_t a = 0, b = activeSourceCount - 1; a < b; a++, b--) {
+                    Instance* t = frame->instanceList[a];
+                    frame->instanceList[a] = frame->instanceList[b];
+                    frame->instanceList[b] = t;
                 }
             }
-
-            arrfree(activeInstances);
         }
 
         if (arrlen(frame->instanceList) == 0) {
@@ -2328,8 +2652,9 @@ static void handlePopEnv(VMContext* ctx, uint32_t instr, uint32_t instrAddr) {
         // Restore context and pop frame
         restoreEnvContext(ctx, frame);
         ctx->envStack = frame->parent;
-        arrfree(frame->instanceList);
-        free(frame);
+        arrsetlen(frame->instanceList, 0); // keep the buffer, just empty it
+        frame->parent = ctx->envFreeList;  // return the frame to the pool
+        ctx->envFreeList = frame;
         return;
     }
 
@@ -2354,8 +2679,9 @@ static void handlePopEnv(VMContext* ctx, uint32_t instr, uint32_t instrAddr) {
     // Done iterating - restore context and pop frame
     restoreEnvContext(ctx, frame);
     ctx->envStack = frame->parent;
-    arrfree(frame->instanceList);
-    free(frame);
+    arrsetlen(frame->instanceList, 0); // keep the buffer, just empty it
+    frame->parent = ctx->envFreeList;  // return the frame to the pool
+    ctx->envFreeList = frame;
 }
 
 // ===[ Execution Loop ]===
@@ -2834,6 +3160,9 @@ static RValue executeLoop(VMContext* ctx) {
         if (ctx->profiler != nullptr)
             Profiler_tickInstruction(ctx->profiler);
 #endif
+#ifdef ENABLE_VMPROF
+        g_vmProfOps++; // TEMP VM-PROFILE
+#endif
         uint32_t instrAddr = ip;
         uint32_t instr = BinaryUtils_readUint32Aligned(bytecodeBase + ip);
         ip += 4;
@@ -2970,7 +3299,25 @@ static RValue executeLoop(VMContext* ctx) {
             }
             case OP_PUSHGLB: {
                 uint32_t varRef = resolveVarOperand(extraData);
-                // TODO: Re-add fast-path here!
+                // Fast path for a plain scalar global read (global.plot / global.flag / ...):
+                // skip resolveVariableRead's array-access pop, stacktop branch and builtin
+                // switch and read the slot directly. Mirrors the OP_PUSH fast path above;
+                // the instance type is always INSTANCE_GLOBAL here. Array globals
+                // (VARTYPE_ARRAY) and builtin globals (varID < 0) fall through unchanged.
+                uint8_t varType = (uint8_t) ((varRef >> 24) & 0xF8);
+                if (varType == VARTYPE_NORMAL) {
+                    Variable* varDef = resolveVarDef(ctx, varRef);
+                    if (varDef->varID >= 0) {
+                        RValue fastVal;
+                        if (tryFastVarRead(ctx, INSTANCE_GLOBAL, varDef, &fastVal)) {
+                            stackPushTyped(ctx, fastVal, GML_TYPE_VARIABLE);
+#ifdef ENABLE_VM_TRACING
+                            VM_checkIfVariableShouldBeTracedAndLog(ctx, "global", nullptr, varDef->name, fastVal, false, -1, -1, "");
+#endif
+                            break;
+                        }
+                    }
+                }
                 RValue val = resolveVariableRead(ctx, INSTANCE_GLOBAL, varRef);
                 stackPushTyped(ctx, val, GML_TYPE_VARIABLE);
                 break;
@@ -3023,10 +3370,10 @@ static RValue executeLoop(VMContext* ctx) {
                         slotA->real = aVal + bVal;
                         slotA->type = RVALUE_REAL;
                     }
-                    slotA->gmlStackType = instrType2(instr);
+                    slotA->gmlStackType = binaryResultType(instr);
                     ctx->stack.top--;
                 } else {
-                    uint8_t resultType = instrType2(instr);
+                    uint8_t resultType = binaryResultType(instr);
                     RValue b = stackPop(ctx);
                     RValue a = stackPop(ctx);
                     if (a.type == RVALUE_STRING || b.type == RVALUE_STRING) {
@@ -3060,10 +3407,10 @@ static RValue executeLoop(VMContext* ctx) {
                         slotA->real = aVal - bVal;
                         slotA->type = RVALUE_REAL;
                     }
-                    slotA->gmlStackType = instrType2(instr);
+                    slotA->gmlStackType = binaryResultType(instr);
                     ctx->stack.top--;
                 } else {
-                    uint8_t resultType = instrType2(instr);
+                    uint8_t resultType = binaryResultType(instr);
                     RValue b = stackPop(ctx);
                     RValue a = stackPop(ctx);
 #ifndef NO_RVALUE_INT64
@@ -3093,10 +3440,10 @@ static RValue executeLoop(VMContext* ctx) {
                         slotA->real = aVal * bVal;
                         slotA->type = RVALUE_REAL;
                     }
-                    slotA->gmlStackType = instrType2(instr);
+                    slotA->gmlStackType = binaryResultType(instr);
                     ctx->stack.top--;
                 } else {
-                    uint8_t resultType = instrType2(instr);
+                    uint8_t resultType = binaryResultType(instr);
                     RValue b = stackPop(ctx);
                     RValue a = stackPop(ctx);
                     if (a.type == RVALUE_STRING) {
@@ -3423,6 +3770,13 @@ VMContext* VM_create(DataWin* dataWin) {
     ctx->selfId = -1;
     ctx->otherId = -1;
     ctx->callDepth = 0;
+
+    // Per-call frame arena: 4096 RValue slots (~64KB). Typical frames use a
+    // handful of slots; nesting depth times frame size stays far below this,
+    // and overflow just falls back to the heap per call.
+    ctx->frameArenaCap = 4096;
+    ctx->frameArena = (RValue *)safeCalloc(ctx->frameArenaCap, sizeof(RValue));
+    ctx->frameArenaTop = 0;
     ctx->currentEventType = -1;
     ctx->currentEventSubtype = -1;
     ctx->currentEventObjectIndex = -1;
@@ -3509,6 +3863,15 @@ VMContext* VM_create(DataWin* dataWin) {
         }
     }
     ctx->nextDynamicVarID = maxSelfVarID + 1;
+    // Reverse index for VM_getVariableNameByVarId. Built here rather than incrementally because
+    // the VARI chunk brings its own preassigned IDs; the incremental half lives in
+    // VM_getOrAllocateVarID for names invented later.
+    ctx->varNameById = nullptr;
+    repeat(maxSelfVarID + 1, i) arrput(ctx->varNameById, nullptr);
+    repeat(shlen(ctx->varNameMap), i) {
+        int32_t id = ctx->varNameMap[i].value;
+        if (id >= 0 && id <= maxSelfVarID) ctx->varNameById[id] = ctx->varNameMap[i].key;
+    }
 
     // Build funcName -> codeIndex hash map from SCPT chunk
     ctx->codeIndexByName = nullptr;
@@ -3679,8 +4042,9 @@ RValue VM_executeCode(VMContext* ctx, int32_t codeIndex) {
 
     setCurrentCodeLocalsSlotMap(ctx);
 
+    uint32_t savedFrameArenaTop = ctx->frameArenaTop;
     uint32_t localsCount = computeLocalsCount(ctx, code);
-    RValue* localVars = (RValue *)safeCalloc(localsCount, sizeof(RValue));
+    RValue* localVars = vmFrameAlloc(ctx, localsCount);
     ctx->localVars = localVars;
     ctx->localVarCount = localsCount;
 
@@ -3705,7 +4069,8 @@ RValue VM_executeCode(VMContext* ctx, int32_t codeIndex) {
     repeat(ctx->localVarCount, i) {
         RValue_free(&ctx->localVars[i]);
     }
-    free(ctx->localVars);
+    vmFrameReleaseBlock(ctx, ctx->localVars);
+    ctx->frameArenaTop = savedFrameArenaTop;
     ctx->localVars = nullptr;
     ctx->localVarCount = 0;
 
@@ -3721,6 +4086,7 @@ RValue VM_executeCode(VMContext* ctx, int32_t codeIndex) {
 
 RValue VM_callCodeIndex(VMContext* ctx, int32_t codeIndex, RValue* args, int32_t argCount) {
     require(codeIndex >= 0 && ctx->dataWin->code.count > (uint32_t) codeIndex);
+
     CodeEntry* code = &ctx->dataWin->code.entries[codeIndex];
 
     // Save current frame
@@ -3740,6 +4106,27 @@ RValue VM_callCodeIndex(VMContext* ctx, int32_t codeIndex, RValue* args, int32_t
     ctx->callStack = &frame;
     ctx->callDepth++;
 
+    // Nobody checked this counter before. Each level costs a real C frame (this function plus the
+    // interpreter loop), the PSP main thread has 4MB, and running off it is an Invalid Memory
+    // Access with no trace at all -- the exact death mode that already cost a psplink session.
+    // 2048 is far above any legitimate GML nesting and far below the stack it would take.
+    require(ctx->callDepth < 2048);
+#ifdef PLATFORM_PSP
+    // The depth limit is a proxy; this is the real measurement. Sampled, because the syscall is
+    // not free and one in 64 calls still catches a runaway long before it lands.
+    extern bool g_stackProbeEnabled;
+    if (g_stackProbeEnabled && (ctx->callDepth & 63) == 0) {
+        extern int sceKernelGetThreadStackFreeSize(int thid);
+        extern int sceKernelGetThreadId(void);
+        extern void BsDiag_trace(const char* fmt, int a, int b);
+        int freeBytes = sceKernelGetThreadStackFreeSize(sceKernelGetThreadId());
+        if (freeBytes >= 0 && freeBytes < 64 * 1024) {
+            BsDiag_trace("VM stack low free=%d depth=%d", freeBytes, (int) ctx->callDepth);
+            require(freeBytes >= 16 * 1024);   // named death beats a silent one
+        }
+    }
+#endif
+
     int32_t storedStackTop = ctx->stack.top;
 
     // Set up callee
@@ -3751,8 +4138,9 @@ RValue VM_callCodeIndex(VMContext* ctx, int32_t codeIndex, RValue* args, int32_t
 
     setCurrentCodeLocalsSlotMap(ctx);
 
+    uint32_t savedFrameArenaTop = ctx->frameArenaTop;
     uint32_t localsCount = computeLocalsCount(ctx, code);
-    RValue* localVars = (RValue *)safeCalloc(localsCount, sizeof(RValue));
+    RValue* localVars = vmFrameAlloc(ctx, localsCount);
     ctx->localVars = localVars;
     ctx->localVarCount = localsCount;
 
@@ -3761,7 +4149,7 @@ RValue VM_callCodeIndex(VMContext* ctx, int32_t codeIndex, RValue* args, int32_t
     // the caller's original args remain valid and owner-tracked by the caller.
     RValue* scriptArgs = nullptr;
     if (argCount > 0 && args != nullptr) {
-        scriptArgs = (RValue *)safeCalloc(argCount, sizeof(RValue));
+        scriptArgs = vmFrameAlloc(ctx, (uint32_t) argCount);
         repeat(argCount, argIdx) {
             RValue argCopy = RValue_makeIndependent(args[argIdx]);
             scriptArgs[argIdx] = argCopy;
@@ -3798,14 +4186,15 @@ RValue VM_callCodeIndex(VMContext* ctx, int32_t codeIndex, RValue* args, int32_t
         RValue_free(&ctx->localVars[i]);
     }
 
-    free(ctx->localVars);
+    vmFrameReleaseBlock(ctx, ctx->localVars);
 
     // Free callee script args
     repeat(ctx->scriptArgCount, i) {
         RValue_free(&ctx->scriptArgs[i]);
     }
 
-    free(ctx->scriptArgs);
+    vmFrameReleaseBlock(ctx, ctx->scriptArgs);
+    ctx->frameArenaTop = savedFrameArenaTop;
 
     ctx->localVars = saved->savedLocals;
     ctx->localVarCount = saved->savedLocalsCount;
@@ -4411,9 +4800,26 @@ void VM_free(VMContext* ctx) {
     // Reset mutable runtime state
     VM_reset(ctx);
 
+    // Free the with-statement EnvFrame pool. VM_reset frees the live envStack, but the
+    // pool persists across resets by design, so it is released only here at teardown.
+    {
+        EnvFrame* pooled = ctx->envFreeList;
+        while (pooled != nullptr) {
+            EnvFrame* next = pooled->parent;
+            arrfree(pooled->instanceList);
+            free(pooled);
+            pooled = next;
+        }
+        ctx->envFreeList = nullptr;
+    }
+
     // Free profiler (no-op if never enabled)
     Profiler_destroy(ctx->profiler);
     ctx->profiler = nullptr;
+
+    free(ctx->frameArena);
+    ctx->frameArena = nullptr;
+    ctx->frameArenaCap = ctx->frameArenaTop = 0;
 
 #ifdef ENABLE_VM_OPCODE_PROFILER
     free(ctx->opcodeVariantCounts);
@@ -4428,6 +4834,7 @@ void VM_free(VMContext* ctx) {
         free(ctx->varNameMap[i].key);
     }
     shfree(ctx->varNameMap);
+    arrfree(ctx->varNameById); // entries are borrowed from varNameMap's keys, freed just above
     repeat(shlen(ctx->codeLocalsMap), i) {
         free(ctx->codeLocalsMap[i].key);
     }

@@ -80,11 +80,18 @@ static inline void* requireNotNullFunction(void* ptr, const char* file, int line
 #define requireNotNull(ptr) requireNotNullFunction((void*)ptr, __FILE__, __LINE__, #ptr)
 #define requireNotNullMessage(ptr, msg) requireNotNullFunction((void*)ptr, __FILE__, __LINE__, msg)
 
+// Optional graceful-OOM hook (defined in oom_hook.c, NULL by default). On PSP,
+// abort() is a black screen + console auto-reboot with zero trace — the PSP boot
+// installs a handler here that writes a durable "OOM" trace line and exits
+// cleanly instead. Called BEFORE abort(); a handler that returns falls through.
+extern void (*g_bsOomHook)(const char* file, int line, size_t size);
+
 // Safe allocation macros - check for nullptr and abort with file/line info
 static inline void *safeMallocFunction(size_t size, const char *file, int line) {
     void *ret = malloc(size);
     if (!ret) {
         fprintf(stderr, "FATAL: malloc(%zu) failed at %s:%d\n", size, file, line);
+        if (g_bsOomHook) g_bsOomHook(file, line, size);
         abort();
     }
     return ret;
@@ -95,6 +102,7 @@ static inline void *safeCallocFunction(size_t count, size_t size, const char *fi
     void *ret = calloc(count, size);
     if (!ret) {
         fprintf(stderr, "FATAL: calloc(%zu, %zu) failed at %s:%d\n", count, size, file, line);
+        if (g_bsOomHook) g_bsOomHook(file, line, count * size);
         abort();
     }
     return ret;
@@ -105,6 +113,7 @@ static inline void *safeReallocFunction(void *ptr, size_t size, const char *file
     void *ret = realloc(ptr, size);
     if (!ret) {
         fprintf(stderr, "FATAL: realloc(%zu) failed at %s:%d\n", size, file, line);
+        if (g_bsOomHook) g_bsOomHook(file, line, size);
         abort();
     }
     return ret;
@@ -138,6 +147,7 @@ static inline char *safeStrdupFunction(const char *str, const char *file, int li
     char *ret = strdup(str);
     if (!ret) {
         fprintf(stderr, "FATAL: strdup() failed at %s:%d\n", file, line);
+        if (g_bsOomHook) g_bsOomHook(file, line, str ? strlen(str) + 1 : 0);
         abort();
     }
     return ret;

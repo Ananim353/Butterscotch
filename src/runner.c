@@ -17,6 +17,217 @@
 #include "gettime.h"
 #include "stb_ds.h"
 
+#ifdef PLATFORM_PSP
+// TEMP DIAG: durable phase markers inside Runner_step for the console freeze hunt
+// (implemented in src/psp/main.c; see src/psp/bs_diag.h).
+void BsDiag_trace(const char* fmt, int a, int b);
+void BsDiag_traceHot(const char* fmt, int a, int b);
+// Runtime diagnostic level (RunnerCFG.txt "diag="); see src/psp/bs_diag.h. The per-event
+// timers below are gated on BS_DIAG_FULL so a shipping run pays a branch, not a syscall.
+extern int g_bsDiagLevel;
+#ifndef BS_DIAG_FULL // psp/bs_diag.h defines the same thing; never redefine it
+#define BS_DIAG_FULL (g_bsDiagLevel >= 2)
+#endif
+#define RS_MARK(tag) BsDiag_traceHot(tag, 0, 0)
+
+// TEMP VM-PROFILE: split the draw phase between VM draw events, native default
+// draws (drawSelf) and tiles, with per-event time sampled 1/8 (timer is a syscall).
+// Answers "is the maze's 33ms in the interpreter or in event-dispatch machinery".
+#include <pspthreadman.h>
+static void crprofNote(int32_t objIndex, uint32_t us); // TEMP CRPROF, defined by dispatchInstanceCreationEvents
+static uint32_t g_bsDrawEvCount = 0, g_bsDrawEvSampled = 0, g_bsDrawEvSampledUs = 0;
+static uint32_t g_bsDrawSelfCount = 0, g_bsDrawTileCount = 0, g_bsLayerTileUs = 0;
+void Runner_debugDrawStats(uint32_t* evCount, uint32_t* evEstUs, uint32_t* selfCount, uint32_t* tileCount, uint32_t* layerTileUs) {
+    *evCount = g_bsDrawEvCount;
+    *evEstUs = g_bsDrawEvSampled > 0
+        ? (uint32_t) ((uint64_t) g_bsDrawEvSampledUs * g_bsDrawEvCount / g_bsDrawEvSampled) : 0;
+    *selfCount = g_bsDrawSelfCount;
+    *tileCount = g_bsDrawTileCount;
+    *layerTileUs = g_bsLayerTileUs;
+    g_bsDrawEvCount = g_bsDrawEvSampled = g_bsDrawEvSampledUs = 0;
+    g_bsDrawSelfCount = g_bsDrawTileCount = 0; g_bsLayerTileUs = 0;
+}
+
+// TEMP DRAWPH: where the frame's draw time goes OUTSIDE the scripted Draw events. The finale
+// spends 28-40ms in draw while EVPROF only accounts for 12-19ms and the batch flushes for 2-3;
+// these three cover the rest of Runner_draw. selfUs = instances with NO Draw event, drawn
+// straight by the renderer (invisible to EVPROF); sortUs = rebuilding/sorting the drawable
+// list; beUs = the Draw Begin/End passes over every drawable.
+// evUs is the EXACT total of every scripted Draw event (EVPROF only samples one in four and
+// extrapolates, so its D= cannot settle the question); loopUs is the whole interleaved
+// tile/instance walk. draw - loopUs - sortUs - beUs is then whatever the renderer spends
+// outside all of it.
+static uint32_t g_bsDrawSelfUs = 0, g_bsSortUs = 0, g_bsBeginEndUs = 0;
+static uint32_t g_bsDrawEvExactUs = 0, g_bsDrawLoopUs = 0;
+void Runner_debugDrawPhases(uint32_t* selfUs, uint32_t* sortUs, uint32_t* beUs,
+                            uint32_t* evUs, uint32_t* loopUs) {
+    *selfUs = g_bsDrawSelfUs; *sortUs = g_bsSortUs; *beUs = g_bsBeginEndUs;
+    *evUs = g_bsDrawEvExactUs; *loopUs = g_bsDrawLoopUs;
+    g_bsDrawSelfUs = g_bsSortUs = g_bsBeginEndUs = 0;
+    g_bsDrawEvExactUs = g_bsDrawLoopUs = 0;
+}
+
+// TEMP EVPROF: per-object event timing, sampled 1/4 (battle step/draw hotspot hunt).
+// Kinds: 0=STEP (all subtypes), 1=DRAW_NORMAL, 2=COLLISION, 3=ALARM, 4=OTHER.
+// Nested events (event_perform) are folded into their parent via the depth guard.
+#define BS_EVPROF_KINDS 5
+static uint32_t* g_bsEvUs[BS_EVPROF_KINDS];
+static uint32_t* g_bsEvCnt[BS_EVPROF_KINDS];
+static uint32_t g_bsEvObjCount = 0;
+static int g_bsEvDepth = 0;
+
+static int bsEvProfKind(int32_t eventType, int32_t eventSubtype) {
+    switch (eventType) {
+        case EVENT_STEP:      return 0;
+        case EVENT_DRAW:      return eventSubtype == DRAW_NORMAL ? 1 : -1;
+        case EVENT_COLLISION: return 2;
+        case EVENT_ALARM:     return 3;
+        case EVENT_OTHER:     return 4;
+        default:              return -1;
+    }
+}
+
+static void bsEvProfEnsure(Runner* runner) {
+    if (g_bsEvUs[0] != nullptr) return;
+    g_bsEvObjCount = runner->dataWin->objt.count;
+    for (int k = 0; k < BS_EVPROF_KINDS; k++) {
+        g_bsEvUs[k] = (uint32_t*) calloc(g_bsEvObjCount, sizeof(uint32_t));
+        g_bsEvCnt[k] = (uint32_t*) calloc(g_bsEvObjCount, sizeof(uint32_t));
+    }
+}
+
+// Top-N objects by accumulated event time for the kind; *totalUs gets the sum
+// over ALL objects (top included). Times ALL top-level events (no sampling:
+// the deterministic event order aliased a 1-in-4 counter badly — whole objects
+// vanished from the profile). Costs ~2 timer syscalls per event while enabled.
+// Clears the kind's window.
+int Runner_debugEvProfTop(Runner* runner, int kind, const char** names, uint32_t* counts, uint32_t* usOut, int maxTop, uint32_t* totalUs) {
+    uint32_t* us = g_bsEvUs[kind];
+    uint32_t* cnt = g_bsEvCnt[kind];
+    *totalUs = 0;
+    if (us == nullptr) return 0;
+    for (uint32_t i = 0; i < g_bsEvObjCount; i++) *totalUs += us[i];
+    int n = 0;
+    for (int t = 0; t < maxTop; t++) {
+        uint32_t best = 0; int32_t bestIdx = -1;
+        for (uint32_t i = 0; i < g_bsEvObjCount; i++)
+            if (us[i] > best) { best = us[i]; bestIdx = (int32_t) i; }
+        if (bestIdx < 0) break;
+        names[n] = runner->dataWin->objt.objects[bestIdx].name;
+        counts[n] = cnt[bestIdx];
+        usOut[n] = us[bestIdx];
+        us[bestIdx] = 0; cnt[bestIdx] = 0;
+        n++;
+    }
+    memset(us, 0, g_bsEvObjCount * sizeof(uint32_t));
+    memset(cnt, 0, g_bsEvObjCount * sizeof(uint32_t));
+    return n;
+}
+
+// TEMP SPIKED: per-frame top-3 draw events by inclusive time — names the objects
+// inside a single >40ms spike frame (window-level EVPROF averages hide them).
+// Cleared on read (main reads every frame, prints only on a spike).
+#define BS_FRD_TOP 3
+static int32_t g_bsFrDrawObj[BS_FRD_TOP];
+static uint32_t g_bsFrDrawUs[BS_FRD_TOP];
+static void bsFrDrawNote(int32_t objIndex, uint32_t us) {
+    for (int i = 0; i < BS_FRD_TOP; i++) {
+        if (us > g_bsFrDrawUs[i]) {
+            for (int j = BS_FRD_TOP - 1; j > i; j--) {
+                g_bsFrDrawUs[j] = g_bsFrDrawUs[j - 1];
+                g_bsFrDrawObj[j] = g_bsFrDrawObj[j - 1];
+            }
+            g_bsFrDrawUs[i] = us;
+            g_bsFrDrawObj[i] = objIndex;
+            return;
+        }
+    }
+}
+int Runner_debugFrameDrawTop(Runner* runner, const char** names, uint32_t* usOut, int max) {
+    int n = 0;
+    for (int i = 0; i < max && i < BS_FRD_TOP; i++) {
+        if (g_bsFrDrawUs[i] == 0) break;
+        names[n] = (g_bsFrDrawObj[i] >= 0 && (uint32_t) g_bsFrDrawObj[i] < runner->dataWin->objt.count)
+                   ? runner->dataWin->objt.objects[g_bsFrDrawObj[i]].name : "?";
+        usOut[n] = g_bsFrDrawUs[i];
+        n++;
+    }
+    memset(g_bsFrDrawUs, 0, sizeof(g_bsFrDrawUs));
+    return n;
+}
+
+// Same thing for STEP events. The draw-only version above is why a 463ms battle-entry frame kept
+// printing "obj_flowery_towery_pillars:4046" and looking like nothing happened: the whole spike was
+// in step, where nothing was being attributed at all.
+static int32_t g_bsFrStepObj[BS_FRD_TOP];
+static uint32_t g_bsFrStepUs[BS_FRD_TOP];
+static void bsFrStepNote(int32_t objIndex, uint32_t us) {
+    for (int i = 0; i < BS_FRD_TOP; i++) {
+        if (us > g_bsFrStepUs[i]) {
+            for (int j = BS_FRD_TOP - 1; j > i; j--) {
+                g_bsFrStepUs[j] = g_bsFrStepUs[j - 1];
+                g_bsFrStepObj[j] = g_bsFrStepObj[j - 1];
+            }
+            g_bsFrStepUs[i] = us;
+            g_bsFrStepObj[i] = objIndex;
+            return;
+        }
+    }
+}
+int Runner_debugFrameStepTop(Runner* runner, const char** names, uint32_t* usOut, int max) {
+    int n = 0;
+    for (int i = 0; i < max && i < BS_FRD_TOP; i++) {
+        if (g_bsFrStepUs[i] == 0) break;
+        names[n] = (g_bsFrStepObj[i] >= 0 && (uint32_t) g_bsFrStepObj[i] < runner->dataWin->objt.count)
+                   ? runner->dataWin->objt.objects[g_bsFrStepObj[i]].name : "?";
+        usOut[n] = g_bsFrStepUs[i];
+        n++;
+    }
+    memset(g_bsFrStepUs, 0, sizeof(g_bsFrStepUs));
+    return n;
+}
+
+// TEMP STEPPH: cumulative us per Runner_step phase since last read.
+// 0=prev/anim 1=beginstep 2=alarms 3=kbd/timeline/mouse 4=step 5=motion/async 6=collision 7=endstep 8=views/cleanup
+static uint32_t g_bsStepPh[9];
+void Runner_debugStepPhases(uint32_t* out9) {
+    memcpy(out9, g_bsStepPh, sizeof(g_bsStepPh));
+    memset(g_bsStepPh, 0, sizeof(g_bsStepPh));
+}
+#define BS_STEP_PH(idx) do { if (BS_DIAG_FULL) { uint32_t bsNow = sceKernelGetSystemTimeLow(); g_bsStepPh[idx] += bsNow - bsPhT; bsPhT = bsNow; } } while (0)
+#else
+#define RS_MARK(tag)
+#define BS_STEP_PH(idx)
+// Diagnostic sink for every non-console target. On PSP this writes into a RAM ring flushed to
+// the memory stick (src/psp/main.c); everywhere else it goes to stderr, so a probe written while
+// chasing a console bug also reports when the same build runs on a PC. It used to be a no-op
+// off-PSP, which meant every question needed console time even when the defect reproduced on the
+// desktop. Same two-int signature as the console version.
+void BsDiag_trace(const char* fmt, int a, int b) {
+    fprintf(stderr, "[bs] ");
+    fprintf(stderr, fmt, a, b);
+    fputc('\n', stderr);
+}
+// The "hot" variant is per-frame chatter; silent off-console on purpose.
+void BsDiag_traceHot(const char* fmt, int a, int b) { (void) fmt; (void) a; (void) b; }
+int g_bsDiagLevel = 0;
+// RunnerCFG toggle on the console; always on elsewhere.
+bool g_newBuiltinsEnabled = true;
+#endif
+
+// Scratch for the per-frame tile->element map in Runner_draw (grown, never shrunk).
+static RuntimeLayerElement** g_tileElScratch = NULL;
+static size_t g_tileElScratchCap = 0;
+static RuntimeLayerElement** tileElScratch(size_t count) {
+    if (count > g_tileElScratchCap) {
+        void* np = realloc(g_tileElScratch, count * sizeof(RuntimeLayerElement*));
+        if (np == NULL) return NULL;
+        g_tileElScratch = (RuntimeLayerElement**) np;
+        g_tileElScratchCap = count;
+    }
+    return g_tileElScratch;
+}
+
 // ===[ Runtime Layer Teardown Helpers ]===
 void Runner_freeRuntimeLayer(RuntimeLayer* runtimeLayer) {
     free(runtimeLayer->dynamicName);
@@ -354,6 +565,7 @@ static void Runner_executeResolvedEvent(Runner* runner, Instance* instance, int3
     if (isEventBlockedByPendingRoom(runner, instance, eventType))
         return;
 
+
     VMContext* vm = runner->vmContext;
     int32_t savedEventType = vm->currentEventType;
     int32_t savedEventSubtype = vm->currentEventSubtype;
@@ -382,7 +594,34 @@ static void Runner_executeResolvedEvent(Runner* runner, Instance* instance, int3
     }
 #endif
 
+#ifdef PLATFORM_PSP
+    // TEMP EVPROF: time every top-level event of a profiled kind, keyed by objectIndex.
+    int evKind = bsEvProfKind(eventType, eventSubtype);
+    bool evSampled = false;
+    uint32_t evT0 = 0;
+    if (BS_DIAG_FULL && evKind >= 0 && g_bsEvDepth == 0
+        && instance->objectIndex >= 0 && (uint32_t) instance->objectIndex < runner->dataWin->objt.count) {
+        bsEvProfEnsure(runner);
+        if (g_bsEvUs[0] != nullptr) {
+            evSampled = true;
+            g_bsEvDepth = 1;
+            evT0 = sceKernelGetSystemTimeLow();
+        }
+    }
+#endif
+
     executeCode(runner, instance, codeId);
+
+#ifdef PLATFORM_PSP
+    if (evSampled) {
+        uint32_t evDt = sceKernelGetSystemTimeLow() - evT0;
+        g_bsEvUs[evKind][instance->objectIndex] += evDt;
+        g_bsEvCnt[evKind][instance->objectIndex]++;
+        if (evKind == 1) bsFrDrawNote(instance->objectIndex, evDt);      // TEMP SPIKED
+        else if (evKind == 0) bsFrStepNote(instance->objectIndex, evDt); // TEMP SPIKED (step half)
+        g_bsEvDepth = 0;
+    }
+#endif
 
     vm->currentEventType = savedEventType;
     vm->currentEventSubtype = savedEventSubtype;
@@ -438,7 +677,14 @@ void Runner_executeEventForAll(Runner* runner, int32_t eventType, int32_t eventS
         repeat(snapshotCount, i) {
             Instance* inst = scratch[i];
             if (!inst->active) continue;
-            Runner_executeEvent(runner, inst, eventType, eventSubtype);
+            // Resolve the handler inline instead of via Runner_executeEvent, which would
+            // re-run EventSlotMap_lookup (we already hold `slot`) and add two wrapper
+            // frames per instance. Same pattern the all-instances branch below uses;
+            // every snapshot instance came from a responder bucket, so codeId>=0.
+            int32_t ownerObjectIndex = -1;
+            int32_t codeId = ResolvedEventTable_lookup(&runner->eventTable, inst->objectIndex, slot, &ownerObjectIndex);
+            if (0 > codeId) continue;
+            Runner_executeResolvedEvent(runner, inst, eventType, eventSubtype, codeId, ownerObjectIndex);
         }
         return;
     }
@@ -578,6 +824,7 @@ static DrawKey drawableKey(const Drawable* d) {
         case DRAWABLE_TILE: k.order = d->tileIndex; break;
         case DRAWABLE_INSTANCE: k.order = (int32_t) d->instance->instanceId;  break;
         case DRAWABLE_LAYER: k.order = d->runtimeLayerId; break;
+        case DRAWABLE_PARTICLE_SYSTEM: k.order = d->particleSystemId; break;
     }
     return k;
 }
@@ -592,6 +839,19 @@ static int compareDrawKeys(const DrawKey* a, const DrawKey* b) {
     if (a->type == DRAWABLE_TILE)
         return (a->order > b->order) - (a->order < b->order); // tiles: higher index later
 
+    // Instances at EQUAL depth. The inherited rule is "higher instance id first": the most
+    // recently created instance draws FIRST and therefore ends up BEHIND everything older.
+    // Measured in the chapter 5 finale (draword dump): obj_petal_burst sits at index 45 with
+    // depth 1000500 and obj_flowery_towery at 49 with the SAME depth, so the tower, its two
+    // decorations and the pillars all paint over the attack's petals. The particles are spawned
+    // during the attack, so they always lose — which is why every measurement of them came back
+    // correct (sprite, scale, alpha, texture, unculled screen rect) while nothing appeared.
+    // RunnerCFG "draword_fix=1" switches equal-depth instances to creation order: older behind,
+    // newer on top. Default OFF because this reorders EVERY equal-depth pair in the game; it
+    // earns its default only once a run confirms it helps.
+    extern bool g_drawOrderFix;
+    if (g_drawOrderFix)
+        return (a->order > b->order) - (a->order < b->order);
     return (a->order < b->order) - (a->order > b->order); // instance/layer: higher first
 }
 
@@ -624,11 +884,20 @@ static void fireDrawSubtype(Runner* runner, Drawable* drawables, int32_t drawabl
     }
 }
 
-// GMS2 tilemap cell bit layout (matches HTML5 Function_Layers.js TileIndex/Mirror/Flip/Rotate masks)
-#define GMS2_TILE_INDEX_MASK  0x0007FFFF // bits 0..18
-#define GMS2_TILE_MIRROR_MASK 0x10000000 // bit 28 (horizontal flip)
-#define GMS2_TILE_FLIP_MASK   0x20000000 // bit 29 (vertical flip)
-#define GMS2_TILE_ROTATE_MASK 0x40000000 // bit 30 (90 CW)
+// The GMS2 tilemap cell masks now live in runner.h: draw_tile() decodes the same cells from
+// vm_builtins.c, and two copies of a bit layout is one too many.
+
+// A tilemap cell carries an index into the tileset's TILE-ID TABLE, not a position in the page:
+// GMS2 lets a tileset be reordered after its cells were authored, and stores the mapping. It is
+// the identity for most tilesets (130 of ch5's 147), which is why reading the index as a position
+// worked everywhere it was looked at -- but 16 of them ARE permuted, and for those every cell of
+// every layer using them has been drawing the wrong tile.
+static uint32_t tilesetResolveTileIndex(Background* tileset, uint32_t tileIndex) {
+    if (tileset->gms2TileIds == nullptr || tileset->gms2TileCount == 0) return tileIndex;
+    uint32_t perTile = tileset->gms2ItemsPerTileCount ? tileset->gms2ItemsPerTileCount : 1;
+    if (tileIndex >= tileset->gms2TileCount * perTile) return tileIndex; // out of table: draw as-is
+    return tileset->gms2TileIds[tileIndex];
+}
 
 void Runner_drawTileLayer(Runner* runner, RoomLayerTilesData* data, float layerOffsetX, float layerOffsetY) {
     if (data == nullptr || data->tileData == nullptr) return;
@@ -657,8 +926,9 @@ void Runner_drawTileLayer(Runner* runner, RoomLayerTilesData* data, float layerO
             uint32_t tileIndex = cell & GMS2_TILE_INDEX_MASK;
             if (tileIndex == 0) continue; // 0 = empty
 
-            uint32_t col = tileIndex % columns;
-            uint32_t row = tileIndex / columns;
+            uint32_t pos = tilesetResolveTileIndex(tileset, tileIndex);
+            uint32_t col = pos % columns;
+            uint32_t row = pos / columns;
             int32_t srcX = (int32_t) (col * (tileW + 2 * borderX) + borderX);
             int32_t srcY = (int32_t) (row * (tileH + 2 * borderY) + borderY);
 
@@ -684,6 +954,57 @@ void Runner_drawTileLayer(Runner* runner, RoomLayerTilesData* data, float layerO
     }
 }
 
+// Tile size of a tileset, 0 when the index names no usable tileset. Lets a caller check that
+// the layer it resolved is the one whose geometry its arithmetic assumes.
+uint32_t Runner_tilesetTileWidth(Runner* runner, int32_t backgroundIndex) {
+    DataWin* dw = runner->dataWin;
+    if (0 > backgroundIndex || (uint32_t) backgroundIndex >= dw->bgnd.count) return 0;
+    return dw->bgnd.backgrounds[backgroundIndex].gms2TileWidth;
+}
+
+// One cell of a tileset, at room coordinates, with the caller's colour and alpha -- the
+// per-tile counterpart of the layer draw above, which hardcodes white/opaque because a layer
+// has no per-call draw state. Same cell decode, deliberately: the two must agree.
+//
+// "backgroundIndex" is an index into THIS runner's BGND table, not a tileset id out of the
+// game's own code. The two do not line up (measured: a layer whose GML calls it 17 answers
+// tilemap_get_tileset() = 137), which is why draw_tile() is not exposed to GML and why the one
+// caller resolves the tileset through tilemap_get_tileset first.
+void Runner_drawTileCell(Runner* runner, int32_t backgroundIndex, uint32_t cell,
+                         float x, float y, uint32_t color, float alpha) {
+    if (runner->renderer == nullptr) return;
+    DataWin* dw = runner->dataWin;
+    if (0 > backgroundIndex || (uint32_t) backgroundIndex >= dw->bgnd.count) return;
+
+    Background* tileset = &dw->bgnd.backgrounds[backgroundIndex];
+    if (tileset->gms2TileWidth == 0 || tileset->gms2TileHeight == 0 || tileset->gms2TileColumns == 0) return;
+    if (0 > tileset->tpagIndex) return;
+
+    uint32_t tileIndex = cell & GMS2_TILE_INDEX_MASK;
+    if (tileIndex == 0) return; // 0 = empty
+
+    uint32_t tileW = tileset->gms2TileWidth;
+    uint32_t tileH = tileset->gms2TileHeight;
+    uint32_t borderX = tileset->gms2OutputBorderX;
+    uint32_t borderY = tileset->gms2OutputBorderY;
+    uint32_t columns = tileset->gms2TileColumns;
+    uint32_t pos = tilesetResolveTileIndex(tileset, tileIndex); // cell index -> position in the page
+    int32_t srcX = (int32_t) ((pos % columns) * (tileW + 2 * borderX) + borderX);
+    int32_t srcY = (int32_t) ((pos / columns) * (tileH + 2 * borderY) + borderY);
+
+    bool mirror = (cell & GMS2_TILE_MIRROR_MASK) != 0;
+    bool flip = (cell & GMS2_TILE_FLIP_MASK) != 0;
+    // Negative scale grows the quad the other way; shift by one tile so the cell lands where
+    // the caller asked for it.
+    float dstX = x + (mirror ? (float) tileW : 0.0f);
+    float dstY = y + (flip ? (float) tileH : 0.0f);
+
+    runner->renderer->vtable->drawSpritePart(runner->renderer, tileset->tpagIndex, srcX, srcY,
+                                             (int32_t) tileW, (int32_t) tileH, dstX, dstY,
+                                             mirror ? -1.0f : 1.0f, flip ? -1.0f : 1.0f,
+                                             0.0f, 0.0f, 0.0f, color, alpha);
+}
+
 // Returns true if "drawables" is already in compareDrawableDepth order. Used by the sort-dirty path to skip qsort when small depth perturbations didn't actually cross any neighbor.
 static bool isDrawableArraySorted(Drawable* drawables, int32_t count) {
     for (int32_t i = 1; count > i; i++) {
@@ -704,6 +1025,9 @@ static void refreshDrawableDepths(Runner* runner, Drawable* drawables, int32_t c
         } else if (d->type == DRAWABLE_LAYER) {
             RuntimeLayer* rl = Runner_findRuntimeLayerById(runner, d->runtimeLayerId);
             if (rl != nullptr) d->depth = rl->depth;
+        } else if (d->type == DRAWABLE_PARTICLE_SYSTEM) {
+            ParticleSystem* ps = Particles_systemGet(runner, d->particleSystemId);
+            if (ps != nullptr) d->depth = ps->depth;
         }
     }
 }
@@ -755,9 +1079,63 @@ static void rebuildDrawableCacheIfDirty(Runner* runner) {
             }
         }
 
+        // Particle systems are not room-scoped: a system created in one room keeps running until the
+        // game destroys it, so they are re-added on every rebuild rather than tracked per room.
+        repeat((int32_t) arrlen(runner->particleSystemPool), i) {
+            ParticleSystem* particleSystem = &runner->particleSystemPool[i];
+            if (!particleSystem->used || !particleSystem->automaticDraw) continue;
+            Drawable d;
+            ZERO_STRUCT(d);
+            d.type = DRAWABLE_PARTICLE_SYSTEM;
+            d.depth = particleSystem->depth;
+            d.particleSystemId = (int32_t) i;
+            arrput(runner->cachedDrawables, d);
+        }
+
         int32_t count = (int32_t) arrlen(runner->cachedDrawables);
         if (count > 1) {
             qsort(runner->cachedDrawables, count, sizeof(Drawable), compareDrawables);
+        }
+        // TEMP §2.118: once the battle particles exist, dump who draws AFTER them. Measured on
+        // hardware: their quads reach the screen unculled, correctly sized, with textures
+        // (drawn=14313 notex=23) and are still invisible — so something covers them, and the
+        // draw ORDER is the only thing never printed. Fires once, and only for the room that
+        // has the particles in it.
+        {
+            extern void BsDiag_trace(const char* fmt, int a, int b);
+            static bool dumped = false;
+            int32_t petalIdx = -1;
+            if (!dumped) {
+                for (int32_t i = 0; i < count; i++) {
+                    Drawable* d = &runner->cachedDrawables[i];
+                    if (d->type != DRAWABLE_INSTANCE || d->instance == nullptr) continue;
+                    int32_t oi = d->instance->objectIndex;
+                    if (oi < 0 || (uint32_t) oi >= runner->dataWin->objt.count) continue;
+                    const char* nm = runner->dataWin->objt.objects[oi].name;
+                    if (nm != nullptr && strstr(nm, "petal_burst") != nullptr) { petalIdx = i; break; }
+                }
+            }
+            if (petalIdx >= 0) {
+                dumped = true;
+                char dl[128];
+                snprintf(dl, sizeof(dl), "draword petals at %d of %d", (int) petalIdx, (int) count);
+                BsDiag_trace(dl, 0, 0);
+                // Everything after the particles is drawn on top of them. Twelve entries is
+                // plenty: the culprit is whatever large thing sits just behind that boundary.
+                for (int32_t i = petalIdx; i < count && i < petalIdx + 12; i++) {
+                    Drawable* d = &runner->cachedDrawables[i];
+                    const char* nm = "?";
+                    if (d->type == DRAWABLE_INSTANCE && d->instance != nullptr) {
+                        int32_t oi = d->instance->objectIndex;
+                        if (oi >= 0 && (uint32_t) oi < runner->dataWin->objt.count)
+                            nm = runner->dataWin->objt.objects[oi].name;
+                    } else if (d->type == DRAWABLE_TILE) nm = "<tile>";
+                    else if (d->type == DRAWABLE_LAYER) nm = "<layer>";
+                    else nm = "<partsys>";
+                    snprintf(dl, sizeof(dl), "draword %d depth=%d %s", (int) i, (int) d->depth, nm);
+                    BsDiag_trace(dl, 0, 0);
+                }
+            }
         }
         runner->drawableListStructureDirty = false;
         runner->drawableListSortDirty = false;
@@ -777,18 +1155,33 @@ static void rebuildDrawableCacheIfDirty(Runner* runner) {
 void Runner_draw(Runner* runner) {
     Room* room = runner->currentRoom;
 
+#ifdef PLATFORM_PSP
+    uint32_t tSort0 = sceKernelGetSystemTimeLow();
     rebuildDrawableCacheIfDirty(runner);
+    g_bsSortUs += sceKernelGetSystemTimeLow() - tSort0;
+#else
+    rebuildDrawableCacheIfDirty(runner);
+#endif
     int32_t drawableCount = (int32_t) arrlen(runner->cachedDrawables);
 
     // Draw non-foreground backgrounds (behind everything)
     if (!DataWin_isVersionAtLeast(runner->dataWin, 2, 0, 0, 0))
         drawGMS1Backgrounds(runner, false);
 
+#ifdef PLATFORM_PSP
+    uint32_t tBe0 = sceKernelGetSystemTimeLow();
     fireDrawSubtype(runner, runner->cachedDrawables, drawableCount, DRAW_BEGIN);
+    g_bsBeginEndUs += sceKernelGetSystemTimeLow() - tBe0;
+#else
+    fireDrawSubtype(runner, runner->cachedDrawables, drawableCount, DRAW_BEGIN);
+#endif
 
     // Draw interleaved tiles and instances
     int32_t i = 0;
     DrawKey lastProcessedDrawKey;
+#ifdef PLATFORM_PSP
+    uint32_t tLoop0 = sceKernelGetSystemTimeLow();
+#endif
 
     while (true) {
         if (runner->drawableListSortDirty || runner->drawableListStructureDirty) {
@@ -874,6 +1267,9 @@ void Runner_draw(Runner* runner) {
                 }
 #endif
 
+#ifdef PLATFORM_PSP
+                g_bsDrawTileCount++; // TEMP VM-PROFILE
+#endif
                 Renderer_drawTile(runner->renderer, tile, offsetX, offsetY);
             }
         } else if (d->type == DRAWABLE_INSTANCE) {
@@ -882,11 +1278,40 @@ void Runner_draw(Runner* runner) {
             if (!inst->active || !inst->visible) continue;
             int32_t ownerObjectIndex = -1;
             int32_t codeId = findEventCodeIdAndOwner(runner, inst->objectIndex, EVENT_DRAW, DRAW_NORMAL, &ownerObjectIndex);
+#ifdef PLATFORM_PSP
+            uint32_t tEv0 = (codeId >= 0) ? sceKernelGetSystemTimeLow() : 0;
+#endif
             if (codeId >= 0) {
+#ifdef PLATFORM_PSP
+                // TEMP VM-PROFILE: count every scripted draw event, time every 8th.
+                g_bsDrawEvCount++;
+                if (BS_DIAG_FULL && (g_bsDrawEvCount & 7u) == 0) {
+                    uint32_t t0 = sceKernelGetSystemTimeLow();
+                    Runner_executeResolvedEvent(runner, inst, EVENT_DRAW, DRAW_NORMAL, codeId, ownerObjectIndex);
+                    g_bsDrawEvSampledUs += sceKernelGetSystemTimeLow() - t0;
+                    g_bsDrawEvSampled++;
+                } else
+#endif
                 Runner_executeResolvedEvent(runner, inst, EVENT_DRAW, DRAW_NORMAL, codeId, ownerObjectIndex);
+#ifdef PLATFORM_PSP
+                g_bsDrawEvExactUs += sceKernelGetSystemTimeLow() - tEv0;
+#endif
             } else if (runner->renderer != nullptr) {
+#ifdef PLATFORM_PSP
+                g_bsDrawSelfCount++; // TEMP VM-PROFILE
+                uint32_t tSelf = sceKernelGetSystemTimeLow();
                 Renderer_drawSelf(runner->renderer, inst);
+                g_bsDrawSelfUs += sceKernelGetSystemTimeLow() - tSelf;
+#else
+                Renderer_drawSelf(runner->renderer, inst);
+#endif
             }
+        } else if (d->type == DRAWABLE_PARTICLE_SYSTEM) {
+            // Filtered at draw time, like instance visibility: part_system_automatic_draw can be
+            // toggled from a Draw event that already ran this frame.
+            ParticleSystem* particleSystem = Particles_systemGet(runner, d->particleSystemId);
+            if (particleSystem == nullptr || !particleSystem->automaticDraw) continue;
+            Particles_drawSystem(runner, d->particleSystemId);
         } else if (d->type == DRAWABLE_LAYER) {
             // Re-resolve every iteration: a previous instance's Draw event may have called layer_create/layer_destroy and reallocated runner->runtimeLayers.
             RuntimeLayer* runtimeLayer = Runner_findRuntimeLayerById(runner, d->runtimeLayerId);
@@ -928,16 +1353,41 @@ void Runner_draw(Runner* runner) {
             if (parsedLayer->type == RoomLayerType_Assets) {
                 RoomLayerAssetsData* data = parsedLayer->assetsData;
                 size_t tileElementCount = arrlenu(runtimeLayer->elements);
+#ifdef PLATFORM_PSP
+                uint32_t tileT0 = BS_DIAG_FULL ? sceKernelGetSystemTimeLow() : 0u; // TEMP VM-PROFILE
+#endif
+                // Tile -> runtime element lookup used to be a linear scan of the element
+                // list PER TILE — O(tiles x elements) EVERY frame. The grass maze has 554
+                // asset-layer entries: ~150k pointer compares per frame, about half the
+                // room's draw cost. tileElement points into legacyTiles[], so one pass
+                // over the elements builds the same mapping (first match wins) in O(N+M).
+                RuntimeLayerElement** tileElByIdx = data->legacyTileCount > 0 ? tileElScratch(data->legacyTileCount) : NULL;
+                if (tileElByIdx != NULL) {
+                    memset(tileElByIdx, 0, data->legacyTileCount * sizeof(*tileElByIdx));
+                    repeat(tileElementCount, k) {
+                        RuntimeLayerElement* candidate = &runtimeLayer->elements[k];
+                        if (candidate->type == RuntimeLayerElementType_Tile && candidate->tileElement != nullptr) {
+                            ptrdiff_t ti = candidate->tileElement - data->legacyTiles;
+                            if (ti >= 0 && (size_t) ti < data->legacyTileCount && tileElByIdx[ti] == nullptr)
+                                tileElByIdx[ti] = candidate;
+                        }
+                    }
+                }
                 repeat(data->legacyTileCount, j) {
                     if (runner->renderer != nullptr) {
                         RoomTile* tile = &data->legacyTiles[j];
-                        // Find the matching RuntimeLayerElement so we can honor per-element visibility
+                        // Matching RuntimeLayerElement (honors per-element visibility).
                         RuntimeLayerElement* tileEl = nullptr;
-                        repeat(tileElementCount, k) {
-                            RuntimeLayerElement* candidate = &runtimeLayer->elements[k];
-                            if (candidate->type == RuntimeLayerElementType_Tile && candidate->tileElement == tile) {
-                                tileEl = candidate;
-                                break;
+                        if (tileElByIdx != NULL) {
+                            tileEl = tileElByIdx[j];
+                        } else {
+                            // Scratch alloc failed (OOM edge): fall back to the direct scan.
+                            repeat(tileElementCount, k) {
+                                RuntimeLayerElement* candidate = &runtimeLayer->elements[k];
+                                if (candidate->type == RuntimeLayerElementType_Tile && candidate->tileElement == tile) {
+                                    tileEl = candidate;
+                                    break;
+                                }
                             }
                         }
                         if (tileEl != nullptr && !tileEl->visible) continue;
@@ -978,9 +1428,15 @@ void Runner_draw(Runner* runner) {
 
                         RoomTile runtimeTile = *tile;
                         if (tileEl != nullptr) runtimeTile.alpha = tileEl->alpha;
+#ifdef PLATFORM_PSP
+                        g_bsDrawTileCount++; // TEMP VM-PROFILE (assets-layer tiles)
+#endif
                         Renderer_drawTile(runner->renderer, &runtimeTile, offsetX, offsetY);
                     }
                 }
+#ifdef PLATFORM_PSP
+                if (BS_DIAG_FULL) g_bsLayerTileUs += sceKernelGetSystemTimeLow() - tileT0; // TEMP VM-PROFILE
+#endif
 
                 // Sprite elements are rendered from the runtime element list (not the parsed data) so that layer_sprite_destroy can remove them at runtime.
                 size_t elementCount = arrlenu(runtimeLayer->elements);
@@ -1021,7 +1477,14 @@ void Runner_draw(Runner* runner) {
         }
     }
 
+#ifdef PLATFORM_PSP
+    g_bsDrawLoopUs += sceKernelGetSystemTimeLow() - tLoop0;
+    uint32_t tBe1 = sceKernelGetSystemTimeLow();
     fireDrawSubtype(runner, runner->cachedDrawables, drawableCount, DRAW_END);
+    g_bsBeginEndUs += sceKernelGetSystemTimeLow() - tBe1;
+#else
+    fireDrawSubtype(runner, runner->cachedDrawables, drawableCount, DRAW_END);
+#endif
 
     // Draw foreground backgrounds (in front of instances, behind GUI)
     drawGMS1Backgrounds(runner, true);
@@ -1144,6 +1607,7 @@ void Runner_drawViews(Runner* runner, int32_t gameW, int32_t gameH, bool debugSh
 
     int32_t widescreenBaseW = gameW - runner->widescreenExtraWidth;
     int32_t widescreenBaseH = gameH - runner->widescreenExtraHeight;
+
 
     if (viewsEnabled) {
         repeat(MAX_VIEWS, vi) {
@@ -1691,12 +2155,22 @@ static void initRoom(Runner* runner, int32_t roomIndex) {
         // An earlier instance's Create event may have destroyed this one, skip it!
         if (inst->destroyed) continue;
 
+#ifdef PLATFORM_PSP
+        long long crT0 = BS_DIAG_FULL ? sceKernelGetSystemTimeWide() : 0; // TEMP CRPROF: room-load creates feed the transition freeze
+#endif
         Runner_executeEvent(runner, inst, EVENT_PRECREATE, 0);
         executeCode(runner, inst, roomObj->preCreateCode);
-        if (inst->destroyed) continue;
+        if (inst->destroyed) {
+#ifdef PLATFORM_PSP
+            if (BS_DIAG_FULL) crprofNote(inst->objectIndex, (uint32_t) (sceKernelGetSystemTimeWide() - crT0));
+#endif
+            continue;
+        }
         Runner_executeEvent(runner, inst, EVENT_CREATE, 0);
-        if (inst->destroyed) continue;
-        executeCode(runner, inst, roomObj->creationCode);
+        if (!inst->destroyed) executeCode(runner, inst, roomObj->creationCode);
+#ifdef PLATFORM_PSP
+        if (BS_DIAG_FULL) crprofNote(inst->objectIndex, (uint32_t) (sceKernelGetSystemTimeWide() - crT0));
+#endif
     }
 
     // Run room creation code
@@ -1750,6 +2224,8 @@ static void cleanupState(Runner* runner) {
         free(runner->savedRoomStates);
     }
     runner->savedRoomStates = nullptr;
+
+    Particles_freeAll(runner);
 
     // Drain ds_map/ds_list pools BEFORE bulk-freeing struct instances. Their RValue entries may hold RVALUE_STRUCT refs to structs in runner->structInstances, and RValue_free would deref freed memory if the structs are gone.
     repeat((int32_t) arrlen(runner->dsMapPool), i) {
@@ -1865,12 +2341,14 @@ static void cleanupState(Runner* runner) {
     }
     free(runner->currentIniPath);
     runner->currentIniPath = nullptr;
-    if (runner->cachedIni != nullptr) {
-        Ini_free(runner->cachedIni);
-        runner->cachedIni = nullptr;
+    repeat(INI_CACHE_SLOTS, ii) {
+        if (runner->cachedIni[ii] != nullptr) {
+            Ini_free(runner->cachedIni[ii]);
+            runner->cachedIni[ii] = nullptr;
+        }
+        free(runner->cachedIniPath[ii]);
+        runner->cachedIniPath[ii] = nullptr;
     }
-    free(runner->cachedIniPath);
-    runner->cachedIniPath = nullptr;
 
     // Free open text files
     repeat(MAX_OPEN_TEXT_FILES, i) {
@@ -1918,6 +2396,9 @@ void Runner_reset(Runner* runner) {
 
     runner->pendingRoom = -1;
     runner->asyncLoadMapId = -1;
+    runner->videoStatus = VIDEO_STATUS_CLOSED;
+    runner->videoStartPending = false;
+    runner->videoEndPending = false;
     runner->asyncBufferNextRequestId = 1;
     runner->xboxAccountPickerPendingId = -1;
     runner->xboxAccountPickerPadIndex = 0;
@@ -2234,11 +2715,95 @@ Runner* Runner_create(DataWin* dataWin, VMContext* vm, Renderer* renderer, FileS
     return runner;
 }
 
+#ifdef PLATFORM_PSP
+// TEMP COLPROF globals (collision.h увеличивает их в пиксельном скане).
+uint32_t g_colPixScans = 0, g_colPixTested = 0;
+
+// TEMP CRPROF (battle-start spike): the creation frame of a battle runs ~30 Create
+// events inside the spawner's Step, so EVPROF attributes the whole ~140ms to the
+// spawner. Time every Create dispatch per objectIndex so the PERF window can name
+// the heavy Creates for nativization. NOTE: times are INCLUSIVE — an instance_create
+// inside a Create event counts in both the child's slot and the parent's (read the
+// top entry as "inclusive cost of this spawn chain").
+#define CRPROF_SLOTS 32
+static struct { int32_t obj; uint32_t count; uint32_t us; } g_crprof[CRPROF_SLOTS];
+
+static void crprofNote(int32_t objIndex, uint32_t us) {
+    for (int i = 0; i < CRPROF_SLOTS - 1; i++) {
+        if (g_crprof[i].count == 0) { g_crprof[i].obj = objIndex; g_crprof[i].count = 1; g_crprof[i].us = us; return; }
+        if (g_crprof[i].obj == objIndex) { g_crprof[i].count++; g_crprof[i].us += us; return; }
+    }
+    // Table full: the last slot is a dedicated "other" bucket (obj -2 prints as "?"),
+    // so overflow never corrupts a real object's attribution.
+    g_crprof[CRPROF_SLOTS - 1].obj = -2;
+    g_crprof[CRPROF_SLOTS - 1].count++;
+    g_crprof[CRPROF_SLOTS - 1].us += us;
+}
+
+// Top-N object names by accumulated Create time this window; returns count written,
+// *totalUs = window total. Resets the table.
+int Runner_debugCreateStats(Runner* runner, const char** names, uint32_t* counts, uint32_t* us, int topN, uint32_t* totalUs) {
+    uint32_t total = 0;
+    repeat(CRPROF_SLOTS, i) total += g_crprof[i].us;
+    *totalUs = total;
+    int n = 0;
+    for (; n < topN; n++) {
+        int best = -1; uint32_t bestUs = 0;
+        for (int i = 0; i < CRPROF_SLOTS; i++) {
+            if (g_crprof[i].count != 0 && g_crprof[i].us > bestUs) { best = i; bestUs = g_crprof[i].us; }
+        }
+        if (best < 0) break;
+        int32_t obj = g_crprof[best].obj;
+        names[n] = (obj >= 0 && (uint32_t) obj < runner->dataWin->objt.count) ? runner->dataWin->objt.objects[obj].name : "?";
+        counts[n] = g_crprof[best].count;
+        us[n] = g_crprof[best].us;
+        g_crprof[best].count = 0;
+    }
+    memset(g_crprof, 0, sizeof(g_crprof));
+    return n;
+}
+#endif
+
 static inline void dispatchInstanceCreationEvents(Runner* runner, Instance* inst) {
     inst->createEventFired = true;
+#ifdef PLATFORM_PSP
+    long long crT0 = BS_DIAG_FULL ? sceKernelGetSystemTimeWide() : 0;
+#endif
     Runner_executeEvent(runner, inst, EVENT_PRECREATE, 0);
     Runner_executeEvent(runner, inst, EVENT_CREATE, 0);
+#ifdef PLATFORM_PSP
+    if (BS_DIAG_FULL) crprofNote(inst->objectIndex, (uint32_t) (sceKernelGetSystemTimeWide() - crT0));
+#endif
 }
+
+#ifdef PLATFORM_PSP
+// TEMP STRUCT-PROFILE: field rooms create ~90 structs per frame (~45us each, ~4ms of
+// step) and the long-session heap creep points at struct churn. Attribute creations
+// to the GML code running at the time and watch the live registry size.
+#define SPROF_SLOTS 8
+static struct { const char* name; uint32_t count; } g_sprof[SPROF_SLOTS];
+static uint32_t g_sprofCreates = 0;
+
+void Runner_debugStructStats(Runner* runner, uint32_t* creates, int* live,
+                             const char** names, uint32_t* counts, int topN) {
+    *creates = g_sprofCreates;
+    g_sprofCreates = 0;
+    *live = (int) arrlen(runner->structInstances);
+    for (int t = 0; t < topN; t++) {
+        names[t] = nullptr;
+        counts[t] = 0;
+        int best = -1;
+        for (int i = 0; i < SPROF_SLOTS; i++) {
+            if (g_sprof[i].name != nullptr && g_sprof[i].count > counts[t]) { best = i; counts[t] = g_sprof[i].count; }
+        }
+        if (best < 0) break;
+        names[t] = g_sprof[best].name;
+        g_sprof[best].name = nullptr;
+        g_sprof[best].count = 0;
+    }
+    memset(g_sprof, 0, sizeof(g_sprof));
+}
+#endif
 
 Instance* Runner_createStruct(Runner* runner) {
     Instance* s = Instance_create(runner->nextInstanceId++, STRUCT_OBJECT_INDEX, 0, 0);
@@ -2246,6 +2811,17 @@ Instance* Runner_createStruct(Runner* runner) {
     s->structRegistryIndex = (int32_t) arrlen(runner->structInstances);
     arrput(runner->structInstances, s);
     s->refCount = 1;
+#ifdef PLATFORM_PSP
+    g_sprofCreates++;
+    // currentCodeName points at a stable data.win string — safe to keep by pointer.
+    const char* cn = runner->vmContext != nullptr ? runner->vmContext->currentCodeName : nullptr;
+    if (cn != nullptr) {
+        for (int i = 0; i < SPROF_SLOTS; i++) {
+            if (g_sprof[i].name == cn) { g_sprof[i].count++; break; }
+            if (g_sprof[i].name == nullptr) { g_sprof[i].name = cn; g_sprof[i].count = 1; break; }
+        }
+    }
+#endif
     return s;
 }
 
@@ -2280,12 +2856,31 @@ Instance* Runner_createInstanceWithLayer(Runner* runner, GMLReal x, GMLReal y, i
     return inst;
 }
 
+// Bisect switches for the 2026-08-02 review batch. DEFAULT OFF = the behaviour that shipped before
+// it, because a console regression appeared somewhere in that batch and five guesses failed to find
+// it. RunnerCFG turns them back on one group at a time (fix_engine_on, fix_pins_on, fix_bgio_on,
+// stack_probe_on), so a run can only improve on the known-good state, never degrade it.
+// RunnerCFG "draword_fix=1": equal-depth instances draw in creation order (see compareDrawKeys).
+bool g_drawOrderFix = false;
+bool g_fixEngineEnabled = false;
+// The engine group split into its three members, because the group as a whole reproduced the
+// console regression and the members touch completely different machinery: an instance-copy
+// direction, a collision-loop guard, and a spatial-grid flag. Each defaults to the group flag.
+bool g_fixCopyEnabled = false;   // fix_copy_on=1
+bool g_fixCollEnabled = false;   // fix_coll_on=1
+bool g_fixGridEnabled = false;   // fix_grid_on=1
+bool g_stackProbeEnabled = false;
+bool g_fixBgioEnabled = false;
+
 Instance* Runner_copyInstance(Runner* runner, Instance* source, bool performEvent) {
     requireNotNull(source);
     if (isObjectDisabled(runner, source->objectIndex)) return nullptr;
 
     Instance* inst = createAndInitInstance(runner, runner->nextInstanceId++, source->objectIndex, source->x, source->y);
-    Instance_copyFields(inst, source);
+    // Direction fix is part of the gated batch: off = the old (wrong) order, so the group can be
+    // tested as a whole. See instance.h for why source-first is correct.
+    if (g_fixCopyEnabled) Instance_copyFields(source, inst);
+    else Instance_copyFields(inst, source);
     inst->createEventFired = true;
     if (performEvent) {
         Runner_executeEvent(runner, inst, EVENT_PRECREATE, 0);
@@ -2347,18 +2942,57 @@ RoomLayer* Runner_findRoomLayerById(Room* room, int32_t id) {
     return nullptr;
 }
 
+// Direct-mapped elementId -> (layerId, element index) hints for
+// Runner_findLayerElementById. The full lookup walks EVERY layer's element list (the
+// chase rooms query ~1300 elements per frame through layer_tile_*/layer_get_element_*
+// in rooms with ~1000 elements: 187us per call). A hint is VERIFIED before use — the
+// indexed element must still carry the requested id — so a stale entry (arrdel shift,
+// element moved/destroyed) falls back to a rescan and self-heals; no invalidation
+// hooks needed. layerId 0 = empty slot. Verified index hit costs O(layers) for the
+// id->layer scan + O(1) for the element.
+#define ELEM_HINT_SIZE 256
+typedef struct { uint32_t layerId; uint32_t elemIndex; } ElemHint;
+static ElemHint g_elemHint[ELEM_HINT_SIZE];
+
+// Returns the element's index in rl->elements, or -1 if absent.
+static ptrdiff_t findElementIndexInLayer(RuntimeLayer* rl, int32_t elementId) {
+    size_t elementCount = arrlenu(rl->elements);
+    repeat(elementCount, j) {
+        if ((int32_t) rl->elements[j].id == elementId) return (ptrdiff_t) j;
+    }
+    return -1;
+}
+
 RuntimeLayerElement* Runner_findLayerElementById(Runner* runner, int32_t elementId, RuntimeLayer** outLayer) {
+    ElemHint* hintSlot = &g_elemHint[(uint32_t) elementId & (ELEM_HINT_SIZE - 1)];
+    if (hintSlot->layerId != 0) {
+        RuntimeLayer* hinted = Runner_findRuntimeLayerById(runner, (int32_t) hintSlot->layerId);
+        if (hinted != nullptr) {
+            // O(1) path: the remembered index still holds the requested element.
+            if (hintSlot->elemIndex < arrlenu(hinted->elements)
+                && (int32_t) hinted->elements[hintSlot->elemIndex].id == elementId) {
+                if (outLayer != nullptr) *outLayer = hinted;
+                return &hinted->elements[hintSlot->elemIndex];
+            }
+            // Index went stale (list mutated): rescan just the hinted layer.
+            ptrdiff_t idx = findElementIndexInLayer(hinted, elementId);
+            if (idx >= 0) {
+                hintSlot->elemIndex = (uint32_t) idx;
+                if (outLayer != nullptr) *outLayer = hinted;
+                return &hinted->elements[idx];
+            }
+        }
+    }
     size_t layerCount = arrlenu(runner->runtimeLayers);
     repeat(layerCount, i) {
         RuntimeLayer* runtimeLayer = &runner->runtimeLayers[i];
-        size_t elementCount = arrlenu(runtimeLayer->elements);
-        repeat(elementCount, j) {
-            if ((int32_t) runtimeLayer->elements[j].id == elementId) {
-                if (outLayer != nullptr)
-                    *outLayer = runtimeLayer;
-
-                return &runtimeLayer->elements[j];
-            }
+        ptrdiff_t idx = findElementIndexInLayer(runtimeLayer, elementId);
+        if (idx >= 0) {
+            hintSlot->layerId = runtimeLayer->id;
+            hintSlot->elemIndex = (uint32_t) idx;
+            if (outLayer != nullptr)
+                *outLayer = runtimeLayer;
+            return &runtimeLayer->elements[idx];
         }
     }
     if (outLayer != nullptr) *outLayer = nullptr;
@@ -2421,6 +3055,8 @@ static void Runner_sweepDeadStructs(Runner* runner) {
 
         s->structRegistryIndex = -1;
         s->refCount = 0; // drop the registry's ref; we are about to free
+        // (The 2026-07 PSP "quarantine" that leaked these is gone: the console freeze
+        // was an FPU trap in the VM, not a use-after-free — see PROGRESS-LOG §3.5.)
         Instance_free(s);
     }
 }
@@ -2444,6 +3080,13 @@ void Runner_cleanupDestroyedInstances(Runner* runner) {
     }
     arrsetlen(runner->instances, writeIdx);
 }
+
+// Frame-compare harness: land in a chosen room with zero input, so the PC reference and the
+// PSP build show the SAME scene. -1 = off. Set by --start-room (desktop) / "start_room=" in
+// RunnerCFG.txt (PSP); the jump itself happens in Runner_step.
+static int32_t g_startRoom = -1;
+
+void Runner_setStartRoom(int32_t roomIndex) { g_startRoom = roomIndex; }
 
 void Runner_initFirstRoom(Runner* runner) {
     DataWin* dataWin = runner->dataWin;
@@ -2574,7 +3217,30 @@ static void executeCollisionEvent(Runner* runner, Instance* self, Instance* othe
     }
 #endif
 
+#ifdef PLATFORM_PSP
+    // TEMP EVPROF: collision events bypass Runner_executeResolvedEvent, so time here too.
+    bool evSampled = false;
+    uint32_t evT0 = 0;
+    if (BS_DIAG_FULL && g_bsEvDepth == 0
+        && self->objectIndex >= 0 && (uint32_t) self->objectIndex < runner->dataWin->objt.count) {
+        bsEvProfEnsure(runner);
+        if (g_bsEvUs[0] != nullptr) {
+            evSampled = true;
+            g_bsEvDepth = 1;
+            evT0 = sceKernelGetSystemTimeLow();
+        }
+    }
+#endif
+
     executeCode(runner, self, codeId);
+
+#ifdef PLATFORM_PSP
+    if (evSampled) {
+        g_bsEvUs[2][self->objectIndex] += sceKernelGetSystemTimeLow() - evT0;
+        g_bsEvCnt[2][self->objectIndex]++;
+        g_bsEvDepth = 0;
+    }
+#endif
 
     // Restore event context
     vm->currentEventType = savedEventType;
@@ -3022,6 +3688,14 @@ static void dispatchCollisionEvents(Runner* runner) {
                 qsort(runner->instanceSnapshots + snapBase, snapEnd - snapBase, sizeof(Instance*), sortInstancesByObjectIndexThenInstanceIdAscending);
 
                 for (int32_t snapIdx = snapBase; snapEnd > snapIdx; snapIdx++) {
+                    // NOTE: no self re-check here, deliberately. An independent review flagged
+                    // that a handler destroying self lets the remaining candidates keep firing, and
+                    // a guard for it was tried twice on console: breaking on `!active || destroyed`
+                    // skipped collision pairs the ch5 battle needs (DELTARUNE deactivates whole
+                    // instance sets during a battle transition), and narrowing it to `destroyed`
+                    // alone still left a hole in the battle board. The double-fire was theoretical;
+                    // the damage was visible. If it is ever revisited, it needs a repro first.
+
                     Instance* other = runner->instanceSnapshots[snapIdx];
                     if (!other->active) continue;
                     if (other == self) continue;
@@ -3201,6 +3875,24 @@ static int32_t followAxis(int32_t viewPos, int32_t viewSize, int32_t targetPos, 
     return pos;
 }
 
+// Finds the instance a camera follows (instance id or first active of an object).
+static Instance* findViewTarget(Runner* runner, GMLCamera* camera) {
+    int32_t targetId = camera->objectId;
+    if (targetId >= INSTANCE_ID_BASE) {
+        Instance* target = hmget(runner->instancesById, targetId);
+        if (target != nullptr && (!target->active || target->destroyed)) return nullptr;
+        return target;
+    }
+    if (targetId >= 0 && runner->dataWin->objt.count > (uint32_t) targetId) {
+        Instance** bucket = runner->instancesByObject[targetId];
+        int32_t bucketCount = (int32_t) arrlen(bucket);
+        repeat(bucketCount, i) {
+            if (bucket[i]->active && !bucket[i]->destroyed) return bucket[i];
+        }
+    }
+    return nullptr;
+}
+
 static void updateViews(Runner* runner) {
     if (!runner->viewsEnabled) return;
     Room* room = runner->currentRoom;
@@ -3211,28 +3903,7 @@ static void updateViews(Runner* runner) {
         GMLCamera* camera = Runner_getCameraForView(runner, (int32_t) vi);
         if (camera == nullptr || 0 > camera->objectId) continue;
 
-        // Find the target view instance
-        Instance* target = nullptr;
-        int32_t targetId = camera->objectId;
-
-        if (targetId >= INSTANCE_ID_BASE) {
-            // It's an instance ID - look it up directly
-            target = hmget(runner->instancesById, targetId);
-            if (target != nullptr && (!target->active || target->destroyed)) {
-                target = nullptr;
-            }
-        } else if (targetId >= 0 && runner->dataWin->objt.count > (uint32_t) targetId) {
-            // It's an object index - find first active instance of that object
-            Instance** bucket = runner->instancesByObject[targetId];
-            int32_t bucketCount = (int32_t) arrlen(bucket);
-            repeat(bucketCount, i) {
-                if (bucket[i]->active && !bucket[i]->destroyed) {
-                    target = bucket[i];
-                    break;
-                }
-            }
-        }
-
+        Instance* target = findViewTarget(runner, camera);
         if (target != nullptr) {
             int32_t ix = (int32_t) GMLReal_floor(target->x);
             int32_t iy = (int32_t) GMLReal_floor(target->y);
@@ -3240,6 +3911,48 @@ static void updateViews(Runner* runner) {
             camera->viewY = followAxis(camera->viewY, camera->viewHeight, iy, camera->borderY, camera->speedY, (int32_t) room->height);
         }
     }
+}
+
+// True when every enabled follow-camera already sits where its follow logic would
+// put it with UNLIMITED speed (and its target exists). Used by the PSP present
+// gate: right after a room change the target may be positioned (or the follow may
+// kick in) a step or two late — frames drawn before the camera lands flash the
+// wrong part of the room. Views disabled / no follow target configured => settled.
+bool Runner_viewsSettled(Runner* runner) {
+    if (!runner->viewsEnabled || runner->currentRoom == nullptr) return true;
+    Room* room = runner->currentRoom;
+    repeat(MAX_VIEWS, vi) {
+        RuntimeView* view = &runner->views[vi];
+        if (!view->enabled) continue;
+        GMLCamera* camera = Runner_getCameraForView(runner, (int32_t) vi);
+        if (camera == nullptr || 0 > camera->objectId) continue;
+        Instance* target = findViewTarget(runner, camera);
+        if (target == nullptr) return false; // follow target not spawned/positioned yet
+        int32_t ix = (int32_t) GMLReal_floor(target->x);
+        int32_t iy = (int32_t) GMLReal_floor(target->y);
+        int32_t wantX = followAxis(camera->viewX, camera->viewWidth, ix, camera->borderX, -1, (int32_t) room->width);
+        int32_t wantY = followAxis(camera->viewY, camera->viewHeight, iy, camera->borderY, -1, (int32_t) room->height);
+        int32_t dx = wantX > camera->viewX ? wantX - camera->viewX : camera->viewX - wantX;
+        int32_t dy = wantY > camera->viewY ? wantY - camera->viewY : camera->viewY - wantY;
+        if (dx > 2 || dy > 2) return false;
+    }
+    return true;
+}
+
+// No enabled view follows an object: the camera position is whatever room data /
+// creation code set, applied before the first draw — frame 0 cannot show a wrong
+// camera, so the present gate has nothing to hide. GML enabling a follow later
+// (view_object mid-room) flips this false on that same frame, which is the
+// conservative direction: the gate only consults it right after a room change.
+bool Runner_viewsStatic(Runner* runner) {
+    if (!runner->viewsEnabled || runner->currentRoom == nullptr) return true;
+    repeat(MAX_VIEWS, vi) {
+        RuntimeView* view = &runner->views[vi];
+        if (!view->enabled) continue;
+        GMLCamera* camera = Runner_getCameraForView(runner, (int32_t) vi);
+        if (camera != nullptr && camera->objectId >= 0) return false;
+    }
+    return true;
 }
 
 static void dispatchOutsideRoomEvents(Runner* runner) {
@@ -3571,9 +4284,31 @@ static void tickTimelines(Runner* runner) {
     arrsetlen(runner->instanceSnapshots, snapBase);
 }
 
+// How long the game gets to boot before the harness jumps (game frames; DELTARUNE runs at 30).
+// Must outlast ROOM_INITIALIZE and the intro fade, or the jump lands mid-init.
+#define START_ROOM_AT_FRAME 120
+
 void Runner_step(Runner* runner) {
+    // Frame-compare harness: jump to the requested room once the game has actually booted.
+    // Overriding the FIRST room instead would skip ROOM_INITIALIZE, leaving every global the
+    // room reads undefined — Hometown streets then draw all their decoration variants at once
+    // and some rooms come up black. This is exactly what room_goto does (see vm_builtins.c).
+    if (g_startRoom >= 0 && runner->frameCount >= START_ROOM_AT_FRAME) {
+        int32_t target = g_startRoom;
+        g_startRoom = -1;
+        if ((uint32_t) target < runner->dataWin->room.count) {
+            runner->pendingRoom = target;
+            fprintf(stderr, "Runner: harness jump -> room %d (%s)\n",
+                    target, runner->dataWin->room.rooms[target].name);
+        }
+    }
+
     // The snapshot arena is stack-like and every push must be matched with a pop within the same frame. Assert that invariant at the top of each step: a non-zero length here means some site below pushed without popping, and we want a loud failure with the offending length so we can find it instead of silently leaking until the next frame.
     requireMessageFormatted(__FILE__, __LINE__, arrlen(runner->instanceSnapshots) == 0, "instanceSnapshots arena was not fully popped at end of previous frame (length=%td)", arrlen(runner->instanceSnapshots));
+
+#ifdef PLATFORM_PSP
+    uint32_t bsPhT = BS_DIAG_FULL ? sceKernelGetSystemTimeLow() : 0u; // TEMP STEPPH phase cursor
+#endif
 
     // Save xprevious/yprevious and path_positionprevious for all active instances
     int32_t prevCount = (int32_t) arrlen(runner->instances);
@@ -3626,6 +4361,8 @@ void Runner_step(Runner* runner) {
         }
     }
 
+    BS_STEP_PH(0); // prev-save + animation advance
+
     // Scroll backgrounds
     Runner_scrollBackgrounds(runner);
 
@@ -3639,6 +4376,8 @@ void Runner_step(Runner* runner) {
 
     // Execute Begin Step for all instances
     Runner_executeEventForAll(runner, EVENT_STEP, STEP_BEGIN);
+    RS_MARK("rs1"); // begin-step done
+    BS_STEP_PH(1);
 
     // Process alarms. Outer loop is over alarm slots (matching the native runner's HandleAlarm), and for each slot we walk only the objects in the event table's bySlot range and only those objects' exact instance buckets. Idle instances are further skipped via activeAlarmMask.
     repeat(GML_ALARM_COUNT, alarmIdx) {
@@ -3695,6 +4434,7 @@ void Runner_step(Runner* runner) {
             arrsetlen(runner->instanceSnapshots, snapshotBase);
         }
     }
+    BS_STEP_PH(2); // alarms
 
     RunnerKeyboardState* kb = runner->keyboard;
     for (int32_t key = 0; GML_KEY_COUNT > key; key++) {
@@ -3722,9 +4462,13 @@ void Runner_step(Runner* runner) {
 
     dispatchMouseEvents(runner);
     if (runner->pendingRoom >= 0) { Runner_handlePendingRoomChange(runner); return; }
+    RS_MARK("rs2"); // alarms/keyboard/timelines/mouse done
+    BS_STEP_PH(3);
 
     // Execute Normal Step for all instances
     Runner_executeEventForAll(runner, EVENT_STEP, STEP_NORMAL);
+    RS_MARK("rs3"); // normal step done
+    BS_STEP_PH(4);
 
     // Apply motion: friction, gravity, then x += hspeed, y += vspeed
     int32_t motionCount = (int32_t) arrlen(runner->instances);
@@ -3829,6 +4573,41 @@ void Runner_step(Runner* runner) {
         runner->asyncLoadMapId = -1;
     }
 
+    // Post the video async events. "video_start" goes out one step after the open so the handler that
+    // arms the cutscene runs first, then "video_end" the step after that. Without the pair a game
+    // waiting on the end event never leaves the cutscene room.
+    if (runner->videoStartPending || runner->videoEndPending) {
+        bool isStart = runner->videoStartPending;
+        runner->videoStartPending = false;
+        if (isStart) {
+            runner->videoEndPending = true;
+        } else {
+            runner->videoEndPending = false;
+            runner->videoStatus = VIDEO_STATUS_CLOSED;
+        }
+
+        DsMapEntry* map = nullptr;
+        arrput(runner->dsMapPool, map);
+        int32_t mapId = (int32_t) arrlen(runner->dsMapPool) - 1;
+
+        DsMapEntry** mapPtr = &runner->dsMapPool[mapId];
+        shput(*mapPtr, safeStrdup("type"), RValue_makeOwnedString(safeStrdup(isStart ? "video_start" : "video_end")));
+
+        runner->asyncLoadMapId = mapId;
+        Runner_executeEventForAll(runner, EVENT_OTHER, OTHER_ASYNC_VIDEO);
+
+        mapPtr = &runner->dsMapPool[mapId];
+        if (*mapPtr != nullptr) {
+            repeat(shlen(*mapPtr), j) {
+                free((*mapPtr)[j].key);
+                RValue_free(&(*mapPtr)[j].value);
+            }
+            shfree(*mapPtr);
+            *mapPtr = nullptr;
+        }
+        runner->asyncLoadMapId = -1;
+    }
+
     // Fire pending async buffer save/load completions.
     // Copy the queue first so that new async loads aren't done in the list we are currently iterating.
     if (runner->asyncSaveLoadQueue != nullptr) {
@@ -3864,11 +4643,20 @@ void Runner_step(Runner* runner) {
         arrfree(pending);
     }
 
+    RS_MARK("rs4"); // motion/async done
+    BS_STEP_PH(5);
     // Dispatch collision events
     dispatchCollisionEvents(runner);
+    BS_STEP_PH(6);
 
     // Execute End Step for all instances
     Runner_executeEventForAll(runner, EVENT_STEP, STEP_END);
+    RS_MARK("rs5"); // collisions + end-step done
+    BS_STEP_PH(7);
+
+    // Step particle systems left on automatic update. After End Step, so a system whose emitters were
+    // just reconfigured streams with this frame's settings, and before the draw pass that shows them.
+    Particles_updateAutomatic(runner);
 
     // Update view following
     updateViews(runner);
@@ -3877,6 +4665,8 @@ void Runner_step(Runner* runner) {
     Runner_sweepDeadStructs(runner);
 
     runner->frameCount++;
+    RS_MARK("rs6"); // step fully done
+    BS_STEP_PH(8);
 }
 
 // ===[ Surface Stack ]===

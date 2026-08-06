@@ -229,6 +229,9 @@ typedef struct {
     bool traceFrames;
     bool printRooms;
     bool printObjects;
+    bool printBackgrounds;
+    bool printSprites;
+    bool printFonts;
     bool printShaders;
     bool printDeclaredFunctions;
     bool printUnknownFunctions;
@@ -248,6 +251,7 @@ typedef struct {
     float widescreenAspect; // "widescreen hack" target aspect ratio (width/height), 0 = disabled
     char** gameArgs; // stb_ds array of owned strings, gameArgs[0] = runner executable path
     bool lazyRooms;
+    int32_t startRoom; // -1 = normal boot (roomOrder[0]); see --start-room
     StringBooleanEntry* eagerRooms; // stb_ds string-keyed set of room names
     bool lazyTextures;
     DataWinLoadType loadType;
@@ -397,6 +401,7 @@ static void printUsage(const char *argv0) {
 #endif
         "    --print-rooms                          - Print all rooms in the game and exit\n"
         "    --print-objects                        - Print all objects in the game and exit\n"
+        "    --print-backgrounds                    - Print all backgrounds/tilesets in the game and exit\n"
         "    --print-shaders                        - Print all shaders in the game and exit\n"
         "    --print-declared-functions             - Print all declared functions in the game and exit\n"
         "    --print-unknown-functions              - Print all unknown functions used by the game and exit\n"
@@ -429,11 +434,13 @@ static void printUsage(const char *argv0) {
         "    --renderer <renderer>                  - Set the rendering API\n"
         "    --lazy-rooms                           - Lazily load rooms, increases load times but reduces memory usage\n"
         "    --eager-room <rooms>                   - When --lazy-rooms is set, keep these rooms always in memory\n"
+        "    --start-room <index>                   - Boot straight into this room (see --print-rooms)\n"
         "    --os-type <os>                         - Set the reported OS type\n"
         "    --window-size <dimentions>             - Set a custom window size\n"
         "    --widescreen-hack <aspect ratio>       - Set a custom aspect ratio\n"
         "    --profile-gml-scripts                  - Log which GML scripts are the heaviest in terms of time and executed instructions\n"
         "    --save-folder <directory>              - Set the directory will save files will be stored\n"
+        "    --draword-fix                          - Equal-depth instances draw in creation order\n"
         "    --game-args <args>                     - Arguments to pass to the game\n"
         "    --lazy-textures                        - Load textures into VRAM on first use, improving startup times\n"
         "    --load-type <type>                     - Specify how data.win is loaded, per-chunk or all at once\n"
@@ -456,6 +463,9 @@ static void parseCommandLineArgs(CommandLineArgs* args, int argc, char* argv[]) 
         {"headless",            no_argument,       nullptr, 'h'},
         {"print-rooms", no_argument,               nullptr, 'r'},
         {"print-objects", no_argument,             nullptr, 'b'},
+        {"print-backgrounds", no_argument,           nullptr, 996},
+        {"print-sprites", no_argument,               nullptr, 995},
+        {"print-fonts", no_argument,                 nullptr, 994},
         {"print-shaders", no_argument,               nullptr, 998},
         {"print-declared-functions", no_argument,  nullptr, 'p'},
         {"print-unknown-functions", no_argument, nullptr, 'u'},
@@ -488,6 +498,7 @@ static void parseCommandLineArgs(CommandLineArgs* args, int argc, char* argv[]) 
         {"renderer", required_argument, nullptr, 'g'},
         {"lazy-rooms", no_argument, nullptr, 'z'},
         {"eager-room", required_argument, nullptr, 'G'},
+        {"start-room", required_argument, nullptr, 997},
         {"os-type", required_argument, nullptr, 'O'},
         {"window-size", required_argument, nullptr, 'w'},
         {"widescreen-hack", optional_argument, nullptr, 1000},
@@ -496,6 +507,10 @@ static void parseCommandLineArgs(CommandLineArgs* args, int argc, char* argv[]) 
         {"game-args", required_argument, nullptr, 'N'},
         {"lazy-textures", no_argument, nullptr, 'L'},
         {"load-type", required_argument, nullptr, 999},
+        // Same switch as RunnerCFG "draword_fix=1" on PSP: equal-depth instances draw in creation
+        // order. Exposed here so the ordering can be A/B'd on the PC in a minute instead of a
+        // console run — see compareDrawKeys in runner.c.
+        {"draword-fix", no_argument, nullptr, 1001},
 #ifdef ENABLE_VM_OPCODE_PROFILER
         {"profile-opcodes", no_argument, nullptr, 'Q'},
 #endif
@@ -504,6 +519,7 @@ static void parseCommandLineArgs(CommandLineArgs* args, int argc, char* argv[]) 
 
     args->screenshotFrames = nullptr;
     args->exitAtFrame = -1;
+    args->startRoom = -1;
     args->traceBytecodeAfterFrame = 0;
     args->speedMultiplier = 1.0;
     args->fastForwardSpeed = 0.0;
@@ -562,6 +578,18 @@ static void parseCommandLineArgs(CommandLineArgs* args, int argc, char* argv[]) 
             case 'b':
                 args->printObjects = true;
                 break;
+            case 994: {
+                args->printFonts = true;
+                break;
+            }
+            case 995: {
+                args->printSprites = true;
+                break;
+            }
+            case 996: {
+                args->printBackgrounds = true;
+                break;
+            }
             case 998: {
                 args->printShaders = true;
                 break;
@@ -686,6 +714,9 @@ static void parseCommandLineArgs(CommandLineArgs* args, int argc, char* argv[]) 
             case 'G':
                 shput(args->eagerRooms, optarg, true);
                 break;
+            case 997:
+                args->startRoom = (int32_t) strtol(optarg, nullptr, 10);
+                break;
             case 'A':
                 shput(args->disassemble, optarg, true);
                 break;
@@ -765,6 +796,12 @@ static void parseCommandLineArgs(CommandLineArgs* args, int argc, char* argv[]) 
                     fprintf(stderr, "Error: Unknown load type '%s'\n", optarg);
                     exit(1);
                 }
+                break;
+            }
+            case 1001: {
+                extern bool g_drawOrderFix;
+                g_drawOrderFix = true;
+                fprintf(stderr, "Runner: draw order fix ON (equal depth = creation order)\n");
                 break;
             }
             case 1000: {
@@ -1121,6 +1158,63 @@ int main(int argc, char* argv[]) {
                     );
                 }
 
+                // Tile layers, with the tileset each one uses. GML resolves these by NAME
+                // (layer_get_id("GRASS") -> scr_layer_tilemap_get_id_fixed), and several ch5
+                // objects then compare the answer's tileset against a literal, so when a room
+                // carries more than one tile layer the order and the tileset are what decide
+                // whether our resolution agrees with GameMaker's.
+                // Asset layers: sprites placed straight into the room, owned by no object. Room
+                // decoration (lamp posts and the like) lives here, so a room whose only tile layer
+                // is the grass can still be full of art -- and that art is invisible to any search
+                // that only looks at objects and tilemaps.
+                forEachIndexed(RoomLayer, layer, idx2, room->layers, room->layerCount) {
+                    if (layer->type != RoomLayerType_Assets || layer->assetsData == nullptr) continue;
+                    RoomLayerAssetsData* a = layer->assetsData;
+                    printf("  <assets> [%d] layer=\"%s\" depth=%d visible=%d sprites=%u legacyTiles=%u\n",
+                           (int) idx2, layer->name, layer->depth, layer->visible ? 1 : 0,
+                           a->spriteCount, a->legacyTileCount);
+                    forEachIndexed(SpriteInstance, si, idx3, a->sprites, a->spriteCount) {
+                        const char* sn = (si->spriteIndex >= 0 && (uint32_t) si->spriteIndex < dataWin->sprt.count)
+                                             ? dataWin->sprt.sprites[si->spriteIndex].name : "<none>";
+                        // colour carries the TINT AND ALPHA of the placement; a stretched
+                        // spr_pxwhite at alpha 0x40 is a soft light patch, the same sprite drawn
+                        // opaque is a solid white block.
+                        int sw = 0, sh = 0;
+                        if (si->spriteIndex >= 0 && (uint32_t) si->spriteIndex < dataWin->sprt.count) {
+                            sw = (int) dataWin->sprt.sprites[si->spriteIndex].width;
+                            sh = (int) dataWin->sprt.sprites[si->spriteIndex].height;
+                        }
+                        printf("      spr[%d] %s (%d) at %d,%d scale=%.2f,%.2f frame=%.1f rot=%.1f "
+                               "colour=0x%08X (a=%u) src=%dx%d\n",
+                               (int) idx3, sn, si->spriteIndex, si->x, si->y,
+                               (double) si->scaleX, (double) si->scaleY,
+                               (double) si->frameIndex, (double) si->rotation,
+                               si->color, (unsigned) ((si->color >> 24) & 0xFF), sw, sh);
+                    }
+                }
+
+                forEachIndexed(RoomLayer, layer, idx2, room->layers, room->layerCount) {
+                    if (layer->type != RoomLayerType_Tiles || layer->tilesData == nullptr) continue;
+                    int32_t ts = layer->tilesData->backgroundIndex;
+                    const char* tsName = (ts >= 0 && (uint32_t) ts < dataWin->bgnd.count)
+                                             ? dataWin->bgnd.backgrounds[ts].name : "<none>";
+                    // Highest index actually placed: objects that redraw these cells through a
+                    // DIFFERENT tileset (obj_gardenlight lights the grass with tileset 17) only
+                    // work if the indices in use fit that tileset's smaller grid.
+                    uint32_t maxIdx = 0, used = 0;
+                    uint32_t cells = layer->tilesData->tilesX * layer->tilesData->tilesY;
+                    for (uint32_t c = 0; c < cells; c++) {
+                        uint32_t ti = layer->tilesData->tileData[c] & 0x0007FFFFu;
+                        if (ti == 0) continue;
+                        used++;
+                        if (ti > maxIdx) maxIdx = ti;
+                    }
+                    printf("  <tiles> [%d] layer=\"%s\" depth=%d visible=%d tileset=%d (%s) grid=%ux%u maxIndex=%u used=%u\n",
+                           (int) idx2, layer->name, layer->depth, layer->visible ? 1 : 0,
+                           (int) ts, tsName, layer->tilesData->tilesX, layer->tilesData->tilesY,
+                           maxIdx, used);
+                }
+
                 if (loadedHere && !room->eagerlyLoaded) {
                     DataWin_freeRoomPayload(room);
                 }
@@ -1163,6 +1257,93 @@ int main(int argc, char* argv[]) {
                         printf("      Sub Type: %u\n", event->eventSubtype);
                         printf("      Code ID: %d\n", codeId);
                         printf("      Actions: %u\n", event->actionCount);
+                    }
+                }
+            }
+            VM_free(vm);
+            DataWin_free(dataWin);
+            return 0;
+        }
+
+        if (args.printFonts) {
+            // emSize is the field GameMaker redefined: an integer point size in old files, a
+            // NEGATED float pixel size in new ones. A huge value here means it is being read the
+            // wrong way and every text metric derived from it is wrong.
+            forEachIndexed(Font, fnt, idx, dataWin->font.fonts, dataWin->font.count) {
+                printf("[%u] %s (%s) em=%g glyphs=%u range=%u..%u bold=%d italic=%d\n",
+                       (unsigned int) idx, fnt->name ? fnt->name : "?",
+                       fnt->displayName ? fnt->displayName : "?", (double) fnt->emSize,
+                       fnt->glyphCount, fnt->rangeStart, fnt->rangeEnd,
+                       fnt->bold ? 1 : 0, fnt->italic ? 1 : 0);
+            }
+            VM_free(vm);
+            DataWin_free(dataWin);
+            return 0;
+        }
+
+        if (args.printSprites) {
+            forEachIndexed(Sprite, sp, idx, dataWin->sprt.sprites, dataWin->sprt.count) {
+                // Frame 0's texture page and its rect inside it: a sprite that draws nothing on
+                // console while its neighbours draw fine is either missing a page (tpag=-1) or
+                // pointing at a rect the pack never stored.
+                int tp = (sp->textureCount > 0 && sp->tpagIndices != nullptr) ? (int) sp->tpagIndices[0] : -1;
+                int px = -1, py = -1, pw = -1, ph = -1, page = -1;
+                if (tp >= 0 && (uint32_t) tp < dataWin->tpag.count) {
+                    TexturePageItem* it = &dataWin->tpag.items[tp];
+                    px = (int) it->sourceX; py = (int) it->sourceY;
+                    pw = (int) it->sourceWidth; ph = (int) it->sourceHeight;
+                    page = (int) it->texturePageId;
+                }
+                printf("[%u] %s  %dx%d frames=%u origin=%d,%d tpag=%d page=%d src=%d,%d %dx%d\n",
+                       (unsigned int) idx, sp->name != nullptr ? sp->name : "<null>",
+                       (int) sp->width, (int) sp->height, sp->textureCount,
+                       (int) sp->originX, (int) sp->originY, tp, page, px, py, pw, ph);
+            }
+            VM_free(vm);
+            DataWin_free(dataWin);
+            return 0;
+        }
+
+        if (args.printBackgrounds) {
+            // GMS2 keeps plain backgrounds and tile sets in the same chunk, so the tileset
+            // columns are what tells them apart -- and the GML asset index a tileset is referred
+            // to by is this index, which is exactly the thing to check when a tileset literal in
+            // the bytecode does not match what tilemap_get_tileset answers.
+            forEachIndexed(Background, bg, idx, dataWin->bgnd.backgrounds, dataWin->bgnd.count) {
+                if (bg->gms2TileWidth == 0 || bg->gms2TileHeight == 0) {
+                    printf("[%u] %s  (plain background, tpag=%d)\n", (unsigned int) idx, bg->name, bg->tpagIndex);
+                } else {
+                    // The page's own size is the arbiter when the parsed column count looks off:
+                    // cols * (tileW + 2*borderX) has to fit inside the tpag's source rect.
+                    int pw = -1, ph = -1;
+                    if (bg->tpagIndex >= 0 && (uint32_t) bg->tpagIndex < dataWin->tpag.count) {
+                        pw = (int) dataWin->tpag.items[bg->tpagIndex].sourceWidth;
+                        ph = (int) dataWin->tpag.items[bg->tpagIndex].sourceHeight;
+                    }
+                    unsigned int stride = bg->gms2TileWidth + 2 * bg->gms2OutputBorderX + bg->gms2TileSeparationX;
+                    printf("[%u] %s  tile=%ux%u cols=%u count=%u border=%u,%u sep=%u,%u ipt=%u "
+                           "tpag=%d page=%dx%d fitCols=%d\n",
+                           (unsigned int) idx, bg->name, bg->gms2TileWidth, bg->gms2TileHeight,
+                           bg->gms2TileColumns, bg->gms2TileCount,
+                           bg->gms2OutputBorderX, bg->gms2OutputBorderY,
+                           bg->gms2TileSeparationX, bg->gms2TileSeparationY,
+                           bg->gms2ItemsPerTileCount, bg->tpagIndex, pw, ph,
+                           (pw > 0 && stride > 0) ? pw / (int) stride : -1);
+                    // GMS2 stores a tile-id table: the index a tilemap cell carries is looked up
+                    // HERE to get the position in the page, and it is only the identity mapping
+                    // when the tileset was never reordered. Anything that draws a cell through a
+                    // tileset other than the layer's own depends on this being reported honestly.
+                    if (bg->gms2TileIds != nullptr && bg->gms2TileCount > 0) {
+                        uint32_t total = bg->gms2TileCount * (bg->gms2ItemsPerTileCount ? bg->gms2ItemsPerTileCount : 1);
+                        uint32_t firstDiff = UINT32_MAX;
+                        for (uint32_t t = 0; t < total; t++)
+                            if (bg->gms2TileIds[t] != t) { firstDiff = t; break; }
+                        printf("      tileIds: %s", firstDiff == UINT32_MAX ? "identity" : "PERMUTED");
+                        if (firstDiff != UINT32_MAX)
+                            printf(" (first diff at %u -> %u)", firstDiff, bg->gms2TileIds[firstDiff]);
+                        printf("  [");
+                        for (uint32_t t = 0; t < 12 && t < total; t++) printf("%u ", bg->gms2TileIds[t]);
+                        printf("...]\n");
                     }
                 }
             }
@@ -1466,6 +1647,7 @@ int main(int argc, char* argv[]) {
 #endif
 
         // Initialize the first room and fire Game Start / Room Start events
+        Runner_setStartRoom(args.startRoom);
         Runner_initFirstRoom(runner);
 
         // Main loop

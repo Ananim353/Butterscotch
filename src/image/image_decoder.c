@@ -126,8 +126,18 @@ static uint8_t* decodeBz2Qoi(const uint8_t* blob, size_t blobSize, bool gm2022_5
     int height = blob[6] | (blob[7] << 8);
     if (0 >= width || 0 >= height) return nullptr;
 
-    // Upper bound on decompressed QOI: header size + width*height*5 pixel data.
-    size_t uncompressedCapacity = QOI_HEADER_SIZE + (size_t) width * (size_t) height * 5;
+    // Size the decompression buffer. For gm2022_5 the 12-byte header stores the exact
+    // uncompressed length at bytes 8..11 - use it (a font atlas is ~0.9MB here) instead
+    // of the width*height*5 upper bound (~20MB for a 2048x2048 page), which otherwise
+    // makes peak decode memory (uncompressed + raw RGBA) too large for the PSP.
+    size_t upperBound = QOI_HEADER_SIZE + (size_t) width * (size_t) height * 5;
+    size_t uncompressedCapacity = upperBound;
+    if (gm2022_5) {
+        uint32_t storedLen = (uint32_t) blob[8] | ((uint32_t) blob[9] << 8) | ((uint32_t) blob[10] << 16) | ((uint32_t) blob[11] << 24);
+        if (storedLen >= QOI_HEADER_SIZE && (size_t) storedLen <= upperBound) {
+            uncompressedCapacity = storedLen;
+        }
+    }
     uint8_t* uncompressed = (uint8_t*) malloc(uncompressedCapacity);
     if (!uncompressed) return nullptr;
 

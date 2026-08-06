@@ -196,6 +196,13 @@ struct VMContext {
     uint32_t codeEnd;
     RValue* localVars;
     uint32_t localVarCount;
+    // LIFO arena for per-call localVars/scriptArgs frames (VM_executeCode /
+    // VM_callCodeIndex): replaces a calloc+free pair on EVERY event/script call.
+    // Fixed capacity so saved frame pointers stay stable; calls that don't fit
+    // fall back to the heap (released via pointer-range check).
+    RValue* frameArena;
+    uint32_t frameArenaCap; // slots
+    uint32_t frameArenaTop; // slots
     struct Instance* globalScopeInstance; // used when GLOB scripts are being executed, and used for the "global" reference
     struct Instance* currentInstance;
     struct Instance* otherInstance; // "other" instance for collision events
@@ -211,6 +218,7 @@ struct VMContext {
     CallFrame* callStack;
     int32_t callDepth;
     EnvFrame* envStack; // Environment stack for with-statements (PushEnv/PopEnv)
+    EnvFrame* envFreeList; // LIFO pool of released EnvFrames, reused across with-blocks (freed in VM_free)
     RValue* scriptArgs;       // Arguments passed to current script (nullptr for non-script code)
     int32_t scriptArgCount;   // Number of arguments passed
     int32_t selfId;
@@ -252,6 +260,10 @@ struct VMContext {
     IntIntHashMap* codeLocalsSlotMaps;
     // varName -> varID hash map for self/instance-scoped variables (stb_ds).
     struct { char* key; int32_t value; }* varNameMap;
+    // Reverse of varNameMap: varID -> name, indexed directly (stb_ds array, entries borrowed
+    // from varNameMap's keys). Without it VM_getVariableNameByVarId scans the whole name table,
+    // which is thousands of entries in ch5 — see the comment there.
+    char** varNameById;
     int32_t nextDynamicVarID;
     // "codeName\tfuncName" -> true, for deduplicating unknown function warnings
     StringBooleanEntry* loggedUnknownFuncs;

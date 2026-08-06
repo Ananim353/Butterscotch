@@ -92,13 +92,26 @@ void Instance_free(Instance* instance);
 void Instance_structIncRef(Instance* inst);
 void Instance_structDecRef(Instance* inst);
 
-// Deep-copy all mutable fields from source to dst: built-in properties, alarms, selfVars.
+// Deep-copy all mutable fields from source to destination: built-in properties, alarms, selfVars.
 // Does NOT copy instanceId, objectIndex, destroyed, or createEventFired. Strings are duplicated so ownership stays independent. Arrays bump refCount (shared - CoW handles forking on first write).
-void Instance_copyFields(Instance* dst, Instance* source);
+//
+// Parameter order is SOURCE FIRST, matching the definition. It used to be declared (dst, source)
+// here while instance.c defined (source, destination), and the single caller trusted this header:
+// instance_copy() therefore copied the blank fresh clone OVER the original, wiping its alarms,
+// speeds, path and sprite, and returned an empty copy. DELTARUNE hits this in ch5 (the finale's
+// obj_plat_tomebullet and the fountain-closing cutscene) with no trace in any log.
+void Instance_copyFields(Instance* source, Instance* destination);
+
+#ifdef ENABLE_VMPROF
+extern uint64_t g_bsVarLookups; // TEMP VM-PROFILE (defined in vm.c)
+#endif
 
 // Get a self variable by varID. Returns RVALUE_UNDEFINED if absent. The returned RValue is non-owning (weak view - do not RValue_free unless you incRef/strdup first to strengthen).
 static inline RValue Instance_getSelfVar(Instance* inst, int32_t varID) {
     requireNotNull(inst);
+#ifdef ENABLE_VMPROF
+    g_bsVarLookups++; // TEMP VM-PROFILE
+#endif
     return IntRValueHashMap_get(&inst->selfVars, varID);
 }
 
@@ -107,6 +120,9 @@ static inline RValue Instance_getSelfVar(Instance* inst, int32_t varID) {
 // The caller retains ownership of their original `val` and remains responsible for freeing it (via RValue_free) when done.
 static inline void Instance_setSelfVar(Instance* inst, int32_t varID, RValue val) {
     requireNotNull(inst);
+#ifdef ENABLE_VMPROF
+    g_bsVarLookups++; // TEMP VM-PROFILE
+#endif
     // One lookup: returns the existing slot, or inserts UNDEFINED and returns the new slot.
     RValue* pointerToSlot = IntRValueHashMap_getOrInsertUndefined(&inst->selfVars, varID);
     RValue independentVal = RValue_makeIndependent(val);

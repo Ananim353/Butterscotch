@@ -335,6 +335,83 @@ static inline bool Collision_pointInInstance(Sprite* spr, Instance* inst, GMLRea
     return true;
 }
 
+#ifdef PLATFORM_PSP
+// TEMP COLPROF: how much of place_meeting's ~590us/call sits in the precise pixel
+// scan vs the grid walk. Defined in runner.c, printed by the PERF window.
+extern uint32_t g_colPixScans, g_colPixTested;
+#endif
+
+// Per-instance state for the precise pixel scan: everything Collision_pointInInstance
+// re-derives per pixel that is actually constant per instance — the rotated path paid
+// a sinf+cosf PER PIXEL, and both paths paid two float divides per pixel. Semantics
+// match pointInInstance exactly except divide-by-scale becomes multiply-by-reciprocal
+// (<=1ulp difference on a value that is then truncated to a pixel index).
+typedef struct {
+    Instance* inst;
+    GMLReal cs, sn;        // rotation (identity when not rotated)
+    GMLReal invXs, invYs;  // 1/imageXscale, 1/imageYscale
+    GMLReal ox, oy;        // sprite origin
+    int32_t w, h;          // full sprite bounds (pointInInstance bounds-checks these)
+    bool rotated;
+    bool degenerate;       // |scale| ~ 0: pointInInstance always false
+    // Precise mask (sepMasks == 1) for the instance's current frame; NULL when bbox-only.
+    const uint8_t* mask;
+    int32_t maskOx, maskOy, maskW, maskH, maskStride;
+} CollisionPixProbe;
+
+static inline CollisionPixProbe Collision_pixProbeInit(Sprite* spr, Instance* inst) {
+    CollisionPixProbe p;
+    p.inst = inst;
+    p.degenerate = 0.0001 > GMLReal_fabs(inst->imageXscale) || 0.0001 > GMLReal_fabs(inst->imageYscale);
+    p.rotated = GMLReal_fabs(inst->imageAngle) > 0.0001;
+    if (p.rotated) {
+        GMLReal rad = inst->imageAngle * M_PI / 180.0;
+        p.cs = GMLReal_cos(rad);
+        p.sn = GMLReal_sin(rad);
+    } else {
+        p.cs = 1.0; p.sn = 0.0;
+    }
+    p.invXs = p.degenerate ? 0.0 : (GMLReal) 1.0 / inst->imageXscale;
+    p.invYs = p.degenerate ? 0.0 : (GMLReal) 1.0 / inst->imageYscale;
+    p.ox = (GMLReal) spr->originX;
+    p.oy = (GMLReal) spr->originY;
+    p.w = (int32_t) spr->width;
+    p.h = (int32_t) spr->height;
+    if (Collision_hasFrameMasks(spr)) {
+        uint32_t frameIdx = ((uint32_t) inst->imageIndex) % spr->maskCount;
+        p.mask = spr->masks[frameIdx];
+        p.maskOx = spr->maskOffsetX;
+        p.maskOy = spr->maskOffsetY;
+        p.maskW = (int32_t) spr->maskWidth;
+        p.maskH = (int32_t) spr->maskHeight;
+        p.maskStride = (int32_t) ((spr->maskWidth + 7) / 8);
+    } else {
+        p.mask = nullptr;
+        p.maskOx = p.maskOy = p.maskW = p.maskH = p.maskStride = 0;
+    }
+    return p;
+}
+
+// Collision_pointInInstance with the per-instance constants precomputed.
+static inline bool Collision_pixProbeTest(const CollisionPixProbe* p, GMLReal wpx, GMLReal wpy) {
+    if (p->degenerate) return false;
+    GMLReal dx = wpx - p->inst->x;
+    GMLReal dy = wpy - p->inst->y;
+    if (p->rotated) {
+        GMLReal rx = p->cs * dx - p->sn * dy;
+        GMLReal ry = p->sn * dx + p->cs * dy;
+        dx = rx; dy = ry;
+    }
+    int32_t ix = (int32_t) (dx * p->invXs + p->ox);
+    int32_t iy = (int32_t) (dy * p->invYs + p->oy);
+    if (0 > ix || 0 > iy || ix >= p->w || iy >= p->h) return false;
+    if (p->mask == nullptr) return true;
+    int32_t mx = ix - p->maskOx;
+    int32_t my = iy - p->maskOy;
+    if (0 > mx || 0 > my || mx >= p->maskW || my >= p->maskH) return false;
+    return (p->mask[my * p->maskStride + (mx >> 3)] & (1 << (7 - (mx & 7)))) != 0;
+}
+
 // Returns true if the two instances' collision shapes overlap.
 //
 // Matches the native GMS 1.4 runner's flow in FUN_0043fde0:
@@ -427,13 +504,21 @@ static inline bool Collision_instancesOverlapPrecise(Runner* runner, Instance* a
         sampleOffset = 0.5;
     }
 
+    CollisionPixProbe probeA = Collision_pixProbeInit(sprA, a);
+    CollisionPixProbe probeB = Collision_pixProbeInit(sprB, b);
+#ifdef PLATFORM_PSP
+    g_colPixScans++;
+#endif
+
     for (int32_t py = startY; (compatMode ? py <= endY : py < endY); py++) {
         for (int32_t px = startX; (compatMode ? px <= endX : px < endX); px++) {
             GMLReal wpx = (GMLReal) px + sampleOffset;
             GMLReal wpy = (GMLReal) py + sampleOffset;
-
-            if (!Collision_pointInInstance(sprA, a, wpx, wpy)) continue;
-            if (!Collision_pointInInstance(sprB, b, wpx, wpy)) continue;
+#ifdef PLATFORM_PSP
+            g_colPixTested++;
+#endif
+            if (!Collision_pixProbeTest(&probeA, wpx, wpy)) continue;
+            if (!Collision_pixProbeTest(&probeB, wpx, wpy)) continue;
             return true;
         }
     }

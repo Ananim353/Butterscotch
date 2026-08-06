@@ -174,6 +174,7 @@ void GamePath_computeInternal(GamePath* path) {
 // Get interpolated position at t in [0,1] (yyPath.js:362-409)
 PathPositionResult GamePath_getPosition(GamePath* path, float t) {
     PathPositionResult result = {0};
+    result.speed = 100.0f;
 
     if (path->internalPointCount == 0) return result;
 
@@ -1116,7 +1117,9 @@ static void parseSHDR(BinaryReader* reader, DataWin* dw) {
     Shdr* s = &dw->shdr;
 
     uint32_t* ptrs = readPointerTable(reader, &s->count);
-    s->shaders = (Shader *)safeMalloc(s->count * sizeof(Shader));
+    // calloc, not malloc: some games store a null shader pointer, the slot is then only marked
+    // not-present, and freeing its uninitialised string fields at shutdown is an invalid free.
+    s->shaders = (Shader *)safeCalloc(s->count, sizeof(Shader));
 
     repeat(s->count, i) {
         // Some GameMaker games have a nullptr for the shader, so we'll just mark them as not-present...
@@ -1231,7 +1234,19 @@ static void parseFONT(BinaryReader* reader, DataWin* dw) {
         font->present = true;
         font->name = readStringPtr(reader, dw);
         font->displayName = readStringPtr(reader, dw);
-        font->emSize = BinaryReader_readUint32(reader);
+        // GameMaker changed what this field means without changing its width: the old form is a
+        // point size as a plain integer, the new one is a NEGATED float giving the size in pixels
+        // (UndertaleModTool reads it the same way). Read as an integer, a float bit pattern comes
+        // out as a huge number and every metric derived from it is wrong. Backported from
+        // upstream 46d5b77.
+        uint32_t rawEmSize = BinaryReader_readUint32(reader);
+        if (rawEmSize & (1u << 31)) {
+            float negated;
+            memcpy(&negated, &rawEmSize, sizeof(negated));
+            font->emSize = -negated;
+        } else {
+            font->emSize = (float) rawEmSize;
+        }
         font->bold = BinaryReader_readBool32(reader);
         font->italic = BinaryReader_readBool32(reader);
         font->rangeStart = BinaryReader_readUint16(reader);
@@ -1817,8 +1832,16 @@ static void readRoomLayers(BinaryReader* reader, DataWin* dw, Room* room) {
                 break;
             }
             default: {
-                fprintf(stderr, "Unsupported Room Layer Type %u\n", layer->type);
-                exit(0);
+                // Skip the layer instead of exiting. Room payloads load LAZILY, so this runs
+                // mid-game: a single rotted type dword on the stick used to quit to the XMB with
+                // code 0, which is indistinguishable from the "silent exit" class that already
+                // cost a psplink session. The runner tolerates a layer with no data.
+#ifdef PLATFORM_PSP
+                extern void BsDiag_trace(const char* fmt, int a, int b);
+                BsDiag_trace("roomlayer UNSUPPORTED type=%d skipped", (int) layer->type, 0);
+#endif
+                fprintf(stderr, "Unsupported Room Layer Type %u (skipped)\n", layer->type);
+                break;
             }
         }
     }
@@ -1954,12 +1977,39 @@ static void parseROOM(BinaryReader* reader, DataWin* dw, bool lazyLoadRooms, Str
         }
     }
 
+    // Record spans for the one-read lazy payload load: each room's record ends where
+    // the next one (by FILE ORDER, not index order) begins. Sort a copy of the
+    // pointer table to find each record's successor; the file-order last record has
+    // no successor (recordEnd stays 0 -> the loader streams it the old way).
+    uint32_t* sortedPtrs = (uint32_t*) malloc((size_t) count * sizeof(uint32_t));
+    uint32_t sortedN = 0;
+    if (sortedPtrs != nullptr) {
+        repeat(count, i) if (ptrs[i] != 0) sortedPtrs[sortedN++] = ptrs[i];
+        for (uint32_t a = 1; a < sortedN; a++) { // insertion sort: counts are small
+            uint32_t v = sortedPtrs[a];
+            uint32_t b = a;
+            while (b > 0 && sortedPtrs[b - 1] > v) { sortedPtrs[b] = sortedPtrs[b - 1]; b--; }
+            sortedPtrs[b] = v;
+        }
+    }
+
     rc->rooms = (Room *)safeCalloc(count, sizeof(Room));
     repeat(count, i) {
         if (ptrs[i] == 0) { rc->rooms[i].creationCodeId = -1; continue; }
         BinaryReader_seek(reader, ptrs[i]);
         Room* room = &rc->rooms[i];
         room->present = true;
+        room->recordStartFileOffset = ptrs[i];
+        room->recordEndFileOffset = 0;
+        if (sortedPtrs != nullptr) { // successor of ptrs[i] in sorted order
+            uint32_t lo = 0, hi = sortedN;
+            while (lo < hi) {
+                uint32_t mid = (lo + hi) / 2;
+                if (sortedPtrs[mid] <= ptrs[i]) lo = mid + 1;
+                else hi = mid;
+            }
+            if (lo < sortedN) room->recordEndFileOffset = sortedPtrs[lo];
+        }
 
         // ===[ Header pass ]===
         room->name = readStringPtr(reader, dw);
@@ -2016,6 +2066,7 @@ static void parseROOM(BinaryReader* reader, DataWin* dw, bool lazyLoadRooms, Str
             }
         }
     }
+    free(sortedPtrs);
     free(ptrs);
 }
 
@@ -2367,7 +2418,7 @@ static void parseSTRG(BinaryReader* reader, DataWin* dw) {
     free(ptrs);
 }
 
-static void parseTXTR(BinaryReader* reader, DataWin* dw, size_t chunkEnd) {
+static void parseTXTR(BinaryReader* reader, DataWin* dw, size_t chunkEnd, bool skipBlobs) {
     Txtr* t = &dw->txtr;
 
     uint32_t count;
@@ -2442,14 +2493,16 @@ static void parseTXTR(BinaryReader* reader, DataWin* dw, size_t chunkEnd) {
         }
     }
 
-    // Load blob data into owned buffers
+    // Load blob data into owned buffers (skipped when a full offline texture pack
+    // serves every region — the compressed pages would just sit unused in RAM).
+    if (skipBlobs) return;
     repeat(count, i) {
         if (t->textures[i].blobOffset == 0 || t->textures[i].blobSize == 0) continue;
         t->textures[i].blobData = BinaryReader_readBytesAt(reader, t->textures[i].blobOffset, t->textures[i].blobSize);
     }
 }
 
-static void parseAUDO(BinaryReader* reader, DataWin* dw) {
+static void parseAUDO(BinaryReader* reader, DataWin* dw, bool lazyBlobs) {
     Audo* a = &dw->audo;
 
     uint32_t count;
@@ -2465,8 +2518,9 @@ static void parseAUDO(BinaryReader* reader, DataWin* dw) {
         a->entries[i].present = true;
         a->entries[i].dataSize = BinaryReader_readUint32(reader);
         a->entries[i].dataOffset = (uint32_t)BinaryReader_getPosition(reader);
-        // Load audio data into owned buffer
-        if (a->entries[i].dataSize > 0) {
+        // Load audio data into owned buffer; lazy mode keeps blobs on disk and the
+        // audio backend reads them on demand through lazyLoadFile (data == NULL).
+        if (a->entries[i].dataSize > 0 && !lazyBlobs) {
             a->entries[i].data = (uint8_t *)safeMalloc(a->entries[i].dataSize);
             BinaryReader_readBytes(reader, a->entries[i].data, a->entries[i].dataSize);
         } else {
@@ -2599,6 +2653,18 @@ DataWin* DataWin_parse(const char* filePath, DataWinParserOptions options) {
             options.progressCallback(chunkName, chunkIndex, totalChunks, dw, options.progressCallbackUserData);
         }
 
+#ifdef PLATFORM_PSP
+        // ch5 RAM front (§2.109d): per-chunk heap ledger of the boot baseline.
+        // The 28.5MB ch5 boot was known only as "CODE+STRG+structures" — this
+        // names every resident megabyte. 4CC is traced as a hex int (decode
+        // offline); the ring is enabled before DataWin_parse, so lines survive.
+        extern void BsDiag_trace(const char* fmt, int a, int b);
+        extern int BsDiag_heapUsedKB(void);
+        int bsChunkHeapKB = BsDiag_heapUsedKB();
+        uint32_t bsChunkCc;
+        memcpy(&bsChunkCc, chunkName, 4);
+#endif
+
         // Determine if this chunk will be parsed (and thus needs bulk loading)
         bool shouldParse =
             (options.parseGen8 && memcmp(chunkName, "GEN8", 4) == 0) ||
@@ -2626,9 +2692,23 @@ DataWin* DataWin_parse(const char* filePath, DataWinParserOptions options) {
             (options.parseAudo && memcmp(chunkName, "AUDO", 4) == 0) ||
             (memcmp(chunkName, "ACRV", 4) == 0);
 
+        // Lazy AUDO / blob-less TXTR: the chunk is parsed through plain FILE* reads
+        // (pointer table + per-entry headers only) — bulk-loading it would defeat
+        // the point (chapter 5's AUDO alone is 119MB).
+        bool audoLazy = options.audoLazyOverBytes > 0 && chunkLength > options.audoLazyOverBytes
+                        && memcmp(chunkName, "AUDO", 4) == 0;
+        bool txtrSkip = options.txtrSkipBlobs && memcmp(chunkName, "TXTR", 4) == 0;
+        // Huge ROOM chunk (Pizza Tower: 55MB): bulk-loading it safeMalloc(55MB)'s and OOMs a
+        // 64MB PSP before the first frame. Parse it through plain FILE* reads instead (pointer
+        // table + room headers); the per-room payload is lazy-loaded from the file on demand
+        // anyway, so the big buffer was only ever a parse-speed optimization. Threshold reuses
+        // audoLazyOverBytes (16MB) — small ROOM chunks (DELTARUNE ch1 = 1.8MB) still bulk-load.
+        bool roomStream = options.lazyLoadRooms && options.audoLazyOverBytes > 0
+                          && chunkLength > options.audoLazyOverBytes && memcmp(chunkName, "ROOM", 4) == 0;
+
         // Bulk-read the chunk data into memory for fast parsing
         uint8_t* chunkBuffer = nullptr;
-        if (shouldParse && chunkLength > 0 && options.loadType != DATAWINLOADTYPE_LOAD_IN_MEMORY_AHEAD_OF_TIME) {
+        if (shouldParse && !audoLazy && !txtrSkip && !roomStream && chunkLength > 0 && options.loadType != DATAWINLOADTYPE_LOAD_IN_MEMORY_AHEAD_OF_TIME) {
             chunkBuffer = (uint8_t *)safeMalloc(chunkLength);
             size_t read = fread(chunkBuffer, 1, chunkLength, reader.file);
             if (read != chunkLength) {
@@ -2700,9 +2780,9 @@ DataWin* DataWin_parse(const char* filePath, DataWinParserOptions options) {
         } else if (options.parseStrg && memcmp(chunkName, "STRG", 4) == 0) {
             parseSTRG(&reader, dw);
         } else if (options.parseTxtr && memcmp(chunkName, "TXTR", 4) == 0) {
-            parseTXTR(&reader, dw, chunkEnd);
+            parseTXTR(&reader, dw, chunkEnd, txtrSkip);
         } else if (options.parseAudo && memcmp(chunkName, "AUDO", 4) == 0) {
-            parseAUDO(&reader, dw);
+            parseAUDO(&reader, dw, audoLazy);
         } else {
             printf("Unknown chunk: %.4s (length %u at offset 0x%zX)\n", chunkName, chunkLength, chunkDataStart - 8);
         }
@@ -2712,6 +2792,16 @@ DataWin* DataWin_parse(const char* filePath, DataWinParserOptions options) {
             BinaryReader_clearBuffer(&reader);
             free(chunkBuffer);
         }
+
+#ifdef PLATFORM_PSP
+        {
+            // Delta measured AFTER the transient chunkBuffer is freed = what the
+            // chunk left RESIDENT. Small chunks are skipped to keep the trace lean.
+            int bsDeltaKB = BsDiag_heapUsedKB() - bsChunkHeapKB;
+            if (bsDeltaKB >= 64 || bsDeltaKB <= -64)
+                BsDiag_trace("dwmem %x +%dKB", (int) bsChunkCc, bsDeltaKB);
+        }
+#endif
 
         // Seek to chunk end (skip any unread data or trailing padding)
         if (options.loadType == DATAWINLOADTYPE_LOAD_IN_MEMORY_AHEAD_OF_TIME) {
@@ -3004,6 +3094,10 @@ void DataWin_freeRoomPayload(Room* room) {
     room->payloadLoaded = false;
 }
 
+// Sanity limit for the one-read span: the biggest DELTARUNE room records are well
+// under a megabyte; anything larger means the span math is wrong — stream instead.
+#define ROOM_RECORD_SPAN_MAX (4u * 1024u * 1024u)
+
 void DataWin_loadRoomPayload(DataWin* dw, int32_t roomIndex) {
     require(roomIndex >= 0 && dw->room.count > (uint32_t) roomIndex);
     Room* room = &dw->room.rooms[roomIndex];
@@ -3012,6 +3106,36 @@ void DataWin_loadRoomPayload(DataWin* dw, int32_t roomIndex) {
 
     FILE* f = dw->lazyLoadFile;
     BinaryReader lazyReader = BinaryReader_create(f, dw->fileSize);
+
+    // Fast path: read the WHOLE room record with one command and parse from RAM.
+    // The streamed path did hundreds of tiny freads, and on a memory stick each
+    // command costs ~15-30ms flat — a big room was a 200-500ms freeze on entry.
+    uint32_t start = room->recordStartFileOffset;
+    uint32_t end = room->recordEndFileOffset;
+    if (end > start && end - start <= ROOM_RECORD_SPAN_MAX) {
+        // Every section offset must sit inside the record, or the span math does
+        // not describe this file's layout — fall back to streaming.
+        bool inside = room->backgroundsFileOffset >= start && room->backgroundsFileOffset < end
+                   && room->viewsFileOffset >= start && room->viewsFileOffset < end
+                   && room->gameObjectsFileOffset >= start && room->gameObjectsFileOffset < end
+                   && room->tilesFileOffset >= start && room->tilesFileOffset < end
+                   && (room->layersFileOffset == 0
+                       || (room->layersFileOffset >= start && room->layersFileOffset < end));
+        if (inside) {
+            size_t span = end - start;
+            uint8_t* buf = (uint8_t*) malloc(span);
+            if (buf != nullptr) {
+                if (fseek(f, (long) start, SEEK_SET) == 0 && fread(buf, 1, span, f) == span) {
+                    BinaryReader_setBuffer(&lazyReader, buf, start, span);
+                    readRoomPayload(&lazyReader, dw, room);
+                    free(buf);
+                    return;
+                }
+                free(buf);
+            }
+        }
+    }
+
     readRoomPayload(&lazyReader, dw, room);
 }
 

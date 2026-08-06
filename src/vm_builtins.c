@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h> // strcasecmp for case-insensitive layer name resolution
 #include "math_compat.h"
 #include <ctype.h>
 #include <time.h>
@@ -34,6 +35,30 @@
 
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic ignored "-Wunused-parameter"
+#endif
+
+#ifdef PLATFORM_PSP
+#include <psprtc.h> // sceRtcGetCurrentClockLocalTime: wall clock for date_current_datetime
+// File/audio builtin trace markers (crash-hunt legacy, see PROGRESS-LOG). Demoted to
+// the verbose-gated hot channel: silent by default, flip g_traceVerbose to re-arm.
+void BsDiag_traceHot(const char* fmt, int a, int b);
+#define BFT_MARK(tag) BsDiag_traceHot(tag, 0, 0)
+
+// TEMP SAVE-PROFILE: write_real still measures ~33us/call after the no-malloc
+// formatting fix — split its body (format vs append vs rest) to find the real cost.
+// Dumped+reset by the PERF window in psp/main.c.
+#include <pspthreadman.h>
+unsigned int g_ftwCalls, g_ftwTotalUs, g_ftwFmtUs, g_ftwAppUs, g_ftwNonNumeric;
+
+// TEMP COLPROF: place_meeting measured ~590us/call in battle defense — split it
+// between the grid sync, the cell walk (candidates/bbox computes) and the precise
+// pixel scan (g_colPixScans/g_colPixTested live in runner.c, bumped by collision.h).
+// g_colPreciseObj: objectIndex of the first mask-bearing party seen this window —
+// names WHO forces the pixel scans. Dumped+reset by the PERF window in psp/main.c.
+unsigned int g_colCalls, g_colTotalUs, g_colSyncUs, g_colCand, g_colBBox;
+int g_colPreciseObj = -1;
+#else
+#define BFT_MARK(tag)
 #endif
 
 #define MAX_BACKGROUNDS 8
@@ -222,6 +247,25 @@ static DsStack* dsStackGet(Runner* runner, int32_t id) {
 
 static bool isValidAlarmIndex(int alarmIndex) {
     return alarmIndex >= 0 && GML_ALARM_COUNT > alarmIndex;
+}
+
+// Resolve the room whose scalar props a builtin read/write targets when currentRoom
+// hasn't been assigned yet (before the first room-init): prefer the pending room, else
+// the first room in room order. Returns nullptr when nothing is resolvable. (upstream #335)
+static Room* resolveRoomForBuiltinAccess(Runner* runner) {
+    if (runner->currentRoom != nullptr) return runner->currentRoom;
+
+    DataWin* dataWin = runner->dataWin;
+    if (dataWin == nullptr || dataWin->room.count == 0) return nullptr;
+
+    int32_t roomIndex = runner->pendingRoom;
+    if (roomIndex < 0) {
+        if (dataWin->gen8.roomOrderCount == 0) return nullptr;
+        roomIndex = dataWin->gen8.roomOrder[0];
+    }
+
+    if (roomIndex < 0 || (uint32_t) roomIndex >= dataWin->room.count) return nullptr;
+    return &dataWin->room.rooms[roomIndex];
 }
 
 // Sorted (strcmp-order, LC_ALL=C) table of built-in variable names -> enum IDs.
@@ -874,8 +918,11 @@ RValue VMBuiltins_getVariable(VMContext* ctx, Instance* inst, int16_t builtinVar
         case BUILTIN_VAR_ROOM_LAST:
             return RValue_makeReal((GMLReal) runner->dataWin->gen8.roomOrder[runner->dataWin->gen8.roomOrderCount - 1]);
         case BUILTIN_VAR_ROOM_SPEED:
-            if (runner->currentRoom == nullptr)
+            if (runner->currentRoom == nullptr) {
+                Room* room = resolveRoomForBuiltinAccess(runner);
+                if (room != nullptr) return RValue_makeReal((GMLReal) room->speed);
                 return RValue_makeReal((GMLReal) runner->dataWin->gen8.gms2FPS);
+            }
 
             return RValue_makeReal((GMLReal) runner->currentRoom->speed);
         case BUILTIN_VAR_ROOM_WIDTH:
@@ -1681,18 +1728,28 @@ void VMBuiltins_setVariable(VMContext* ctx, Instance* inst, int16_t builtinVarId
         case BUILTIN_VAR_ROOM:
             runner->pendingRoom = RValue_toInt32(val);
             return;
-        case BUILTIN_VAR_ROOM_PERSISTENT:
-            runner->currentRoom->persistent = RValue_toBool(val);
+        case BUILTIN_VAR_ROOM_PERSISTENT: {
+            Room* room = resolveRoomForBuiltinAccess(runner);
+            if (room != nullptr) room->persistent = RValue_toBool(val);
             return;
-        case BUILTIN_VAR_ROOM_WIDTH:
-            runner->currentRoom->width = (uint32_t) RValue_toInt32(val);
+        }
+        case BUILTIN_VAR_ROOM_WIDTH: {
+            Room* room = resolveRoomForBuiltinAccess(runner);
+            if (room != nullptr) room->width = (uint32_t) RValue_toInt32(val);
             return;
-        case BUILTIN_VAR_ROOM_HEIGHT:
-            runner->currentRoom->height = (uint32_t) RValue_toInt32(val);
+        }
+        case BUILTIN_VAR_ROOM_HEIGHT: {
+            Room* room = resolveRoomForBuiltinAccess(runner);
+            if (room != nullptr) room->height = (uint32_t) RValue_toInt32(val);
             return;
-        case BUILTIN_VAR_ROOM_SPEED:
-            runner->currentRoom->speed = (uint32_t) RValue_toInt32(val);
+        }
+        case BUILTIN_VAR_ROOM_SPEED: {
+            Room* room = resolveRoomForBuiltinAccess(runner);
+            if (room != nullptr) room->speed = (uint32_t) RValue_toInt32(val);
+            // Keep pre-room fallback reads consistent if scripts touch room_speed before room init.
+            if (runner->currentRoom == nullptr) runner->dataWin->gen8.gms2FPS = (float) RValue_toReal(val);
             return;
+        }
 
         // argument[N] - array-style write to script arguments
         case BUILTIN_VAR_ARGUMENT:
@@ -1883,6 +1940,17 @@ static RValue builtin_string_byte_length(MAYBE_UNUSED VMContext* ctx, RValue* ar
 
 static RValue builtin_real(MAYBE_UNUSED VMContext* ctx, RValue* args, int32_t argCount) {
     if (1 > argCount) return RValue_makeReal(0.0);
+    // Fast path for plain decimal strings (see GMLReal_parseDecimalFast): the chase/
+    // checkers layer controllers call real() on layer-name fragments every frame, and
+    // newlib strtod costs ~12us on MIPS.
+    if (args[0].type == RVALUE_STRING && args[0].string != nullptr) {
+        const char* endp = nullptr;
+        bool ok = false;
+        GMLReal r = GMLReal_parseDecimalFast(args[0].string, &endp, &ok);
+        if (ok && *endp == '\0')
+            return RValue_makeReal(r);
+        return RValue_makeReal(GMLReal_strtod(args[0].string, nullptr));
+    }
     return RValue_makeReal(RValue_toReal(args[0]));
 }
 
@@ -2229,9 +2297,9 @@ static RValue builtin_string_count(MAYBE_UNUSED VMContext* ctx, RValue* args, in
 
 // Source - https://stackoverflow.com/a/15515276
 static RValue builtin_string_starts_with(MAYBE_UNUSED VMContext* ctx, RValue* args, int32_t argCount) {
-    if (2 > argCount) return RValue_makeInt32(0);
-    char* substr = RValue_toString(args[0]);
-    char* str = RValue_toString(args[1]);
+    if (2 > argCount) return RValue_makeBool(false);
+    char* str = RValue_toString(args[0]);
+    char* substr = RValue_toString(args[1]);
 
     bool ret = (strncmp(str, substr, strlen(substr)) == 0);
 
@@ -2262,6 +2330,17 @@ static RValue builtin_chr(MAYBE_UNUSED VMContext* ctx, RValue* args, int32_t arg
 
 static RValue builtin_string_pos(MAYBE_UNUSED VMContext* ctx, RValue* args, int32_t argCount) {
     if (2 > argCount) return RValue_makeReal(0.0);
+    // Fast path: both operands already strings — search the borrowed pointers directly.
+    // The generic path malloc-copies BOTH strings per call; the chase controller calls
+    // this ~300 times per frame on layer names (13us/call, mostly allocator traffic).
+    if (args[0].type == RVALUE_STRING && args[1].type == RVALUE_STRING
+        && args[0].string != nullptr && args[1].string != nullptr) {
+        const char* hs = args[1].string;
+        const char* found = strstr(hs, args[0].string);
+        if (found == nullptr) return RValue_makeReal(0.0);
+        int32_t byteIndex = (int32_t) (found - hs);
+        return RValue_makeReal((GMLReal) (TextUtils_utf8CodepointCount(hs, byteIndex) + 1));
+    }
     char* needle = RValue_toString(args[0]);
     char* haystack = RValue_toString(args[1]);
     char* found = strstr(haystack, needle);
@@ -2343,16 +2422,25 @@ static RValue builtin_string_split(MAYBE_UNUSED VMContext* ctx, RValue* args, in
 
 static RValue builtin_string_char_at(MAYBE_UNUSED VMContext* ctx, RValue* args, int32_t argCount) {
     if (2 > argCount) return RValue_makeOwnedString(safeStrdup(""));
-    char* str = RValue_toString(args[0]);
+    // Borrow the source when it's already a string (the common case) instead of
+    // malloc-copying it per call; only the 1-codepoint result needs an allocation.
+    char* owned = nullptr;
+    const char* str;
+    if (args[0].type == RVALUE_STRING && args[0].string != nullptr) {
+        str = args[0].string;
+    } else {
+        owned = RValue_toString(args[0]);
+        str = owned;
+    }
     int32_t pos = RValue_toInt32(args[1]) - 1; // 1-based
     int32_t strLen = (int32_t) strlen(str);
     if (0 > pos || pos >= strLen) {
-        free(str);
+        free(owned);
         return RValue_makeOwnedString(safeStrdup(""));
     }
     int32_t byteStart = TextUtils_utf8AdvanceCodepoints(str, strLen, pos);
     if (byteStart >= strLen) {
-        free(str);
+        free(owned);
         return RValue_makeOwnedString(safeStrdup(""));
     }
     int32_t byteNext = byteStart;
@@ -2361,7 +2449,7 @@ static RValue builtin_string_char_at(MAYBE_UNUSED VMContext* ctx, RValue* args, 
     char* out = (char *)safeMalloc(nbytes + 1);
     memcpy(out, str + byteStart, (size_t) nbytes);
     out[nbytes] = '\0';
-    free(str);
+    free(owned);
     return RValue_makeOwnedString(out);
 }
 
@@ -3320,6 +3408,7 @@ static RValue builtin_room_goto_previous(VMContext* ctx, MAYBE_UNUSED RValue* ar
 }
 
 static RValue builtin_room_goto(VMContext* ctx, RValue* args, int32_t argCount) {
+    BFT_MARK("room goto");
     if (1 > argCount) return RValue_makeUndefined();
     Runner* runner = (Runner *)requireNotNullMessage(ctx->runner, "VM: room_goto called but no runner!");
     runner->pendingRoom = RValue_toInt32(args[0]);
@@ -4617,12 +4706,17 @@ static RValue builtin_ds_list_find_index(VMContext* ctx, RValue* args, MAYBE_UNU
     return RValue_makeReal(-1.0);
 }
 
+extern bool g_newBuiltinsEnabled;
 static RValue builtin_ds_list_shuffle(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
     Runner* runner = ctx->runner;
     int32_t id = RValue_toInt32(args[0]);
     DsList* list = dsListGet(runner, id);
     if (list == nullptr) return RValue_makeUndefined();
-    for (int32_t i = 1; i < argCount; i++) {
+    // Fisher-Yates over the LIST, not over argCount. ds_list_shuffle takes exactly one argument,
+    // so the old loop ran from 1 to 1 and shuffled nothing -- every "random" order in ch5 (bombs,
+    // bullets, spectators, the maze) came out in insertion order, silently and forever.
+    int32_t n = g_newBuiltinsEnabled ? (int32_t) arrlen(list->items) : 1; // off = the old argCount-bound no-op
+    for (int32_t i = n - 1; i > 0; i--) {
         int32_t j = rand() % (i + 1);
         RValue temp = list->items[i];
         list->items[i] = list->items[j];
@@ -5827,6 +5921,96 @@ static RValue builtin_ds_priority_read(VMContext* ctx, RValue* args, MAYBE_UNUSE
 
 // ===[ ARRAY FUNCTIONS ]===
 
+// array_copy(dest, dest_index, src, src_index, length). Was registered as a no-op stub, and its
+// single call site across ch1+ch5 is obj_dw_fcastle_seth_encounter, which then indexes the array
+// it believed was filled -- an undefined member write in the middle of an encounter.
+static RValue builtin_array_copy(MAYBE_UNUSED VMContext* ctx, RValue* args, int32_t argCount) {
+    if (!g_newBuiltinsEnabled) return RValue_makeUndefined(); // bisect switch, see the registration site
+    if (5 > argCount) return RValue_makeUndefined();
+    if (args[0].type != RVALUE_ARRAY || args[0].array == nullptr) return RValue_makeUndefined();
+    if (args[2].type != RVALUE_ARRAY || args[2].array == nullptr) return RValue_makeUndefined();
+    GMLArray* dst = args[0].array;
+    GMLArray* src = args[2].array;
+    int32_t dstIdx = (int32_t) RValue_toReal(args[1]);
+    int32_t srcIdx = (int32_t) RValue_toReal(args[3]);
+    int32_t len = (int32_t) RValue_toReal(args[4]);
+    if (0 > dstIdx || 0 > srcIdx || 1 > len) return RValue_makeUndefined();
+
+    int32_t srcLen = GMLArray_length1D(src);
+    if (srcIdx >= srcLen) return RValue_makeUndefined();
+    if (len > srcLen - srcIdx) len = srcLen - srcIdx;   // GM clamps rather than reading past the end
+
+    GMLArray_growTo(dst, dstIdx + len);
+    // Overlap inside one array is safe in either direction: GMLArray_set strengthens the value
+    // BEFORE freeing the destination slot. Copying backwards when the ranges overlap forwards is
+    // still the correct order, and costs nothing.
+    if (dst == src && dstIdx > srcIdx) {
+        for (int32_t i = len - 1; i >= 0; i--) GMLArray_set(dst, dstIdx + i, GMLArray_get(src, srcIdx + i));
+    } else {
+        for (int32_t i = 0; i < len; i++) GMLArray_set(dst, dstIdx + i, GMLArray_get(src, srcIdx + i));
+    }
+    return RValue_makeUndefined();
+}
+
+// Ordering used when array_sort gets a flag rather than a comparator. GM sorts numbers before
+// strings and strings lexicographically.
+static int arraySortDefaultOrder(const RValue* a, const RValue* b) {
+    bool as = (a->type == RVALUE_STRING), bs = (b->type == RVALUE_STRING);
+    if (as && bs) return strcmp(a->string ? a->string : "", b->string ? b->string : "");
+    if (as != bs) return as ? 1 : -1;
+    GMLReal x = RValue_toReal(*a), y = RValue_toReal(*b);
+    return (x < y) ? -1 : (x > y) ? 1 : 0;
+}
+
+// array_sort(array, ascending_flag_or_comparator). Was not registered at all, so six ch5 call
+// sites (seth's points by X, beet locations by distance, glow tiles, cloud order, sink sprites,
+// the sound maker) silently kept insertion order.
+//
+// Insertion sort, not qsort: with a comparator we re-enter the VM per comparison, and qsort's
+// callback has nowhere to carry VMContext without a global. These arrays hold tens of elements.
+static RValue builtin_array_sort(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (!g_newBuiltinsEnabled) return RValue_makeUndefined(); // bisect switch, see the registration site
+    if (1 > argCount) return RValue_makeUndefined();
+    if (args[0].type != RVALUE_ARRAY || args[0].array == nullptr) return RValue_makeUndefined();
+    GMLArray* arr = args[0].array;
+    int32_t n = GMLArray_length1D(arr);
+    if (2 > n) return RValue_makeUndefined();
+
+    int32_t cmpCode = -1;
+    bool ascending = true;
+    if (argCount >= 2) {
+#if IS_WAD17_OR_HIGHER_ENABLED
+        if (args[1].type == RVALUE_METHOD && args[1].method != nullptr) cmpCode = args[1].method->codeIndex;
+#endif
+        if (0 > cmpCode) ascending = RValue_toBool(args[1]);
+    }
+
+    for (int32_t i = 1; i < n; i++) {
+        RValue key = RValue_makeIndependent(GMLArray_get(arr, i));
+        int32_t j = i - 1;
+        while (j >= 0) {
+            RValue cur = GMLArray_get(arr, j);
+            int order;
+            if (cmpCode >= 0) {
+                RValue cargs[2] = { cur, key };
+                RValue r = VM_callCodeIndex(ctx, cmpCode, cargs, 2);
+                GMLReal ord = RValue_toReal(r);
+                RValue_free(&r);
+                order = (ord < 0) ? -1 : (ord > 0) ? 1 : 0;
+            } else {
+                order = arraySortDefaultOrder(&cur, &key);
+                if (!ascending) order = -order;
+            }
+            if (0 >= order) break;
+            GMLArray_set(arr, j + 1, GMLArray_get(arr, j));
+            j--;
+        }
+        GMLArray_set(arr, j + 1, key);
+        RValue_free(&key);
+    }
+    return RValue_makeUndefined();
+}
+
 static RValue builtin_array_length_1d(MAYBE_UNUSED VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
     if (args[0].type != RVALUE_ARRAY || args[0].array == nullptr) return RValue_makeReal(0.0);
     return RValue_makeReal((GMLReal) GMLArray_length1D(args[0].array));
@@ -6552,6 +6736,7 @@ static RValue builtin_audio_master_gain(VMContext* ctx, RValue* args, MAYBE_UNUS
 }
 
 static RValue builtin_audio_set_master_gain(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    BFT_MARK("au mgain");
     AudioSystem* audio = getAudioSystem(ctx);
     if (audio == nullptr) return RValue_makeUndefined();
     int32_t id = RValue_toInt32(args[0]);
@@ -6874,13 +7059,72 @@ static RValue builtin_gamepad_hat_value(VMContext* ctx, RValue* args, MAYBE_UNUS
 
 // ===[ INI Functions ]===
 
-static void discardIniCache(Runner* runner) {
-    if (runner->cachedIni != nullptr) {
-        Ini_free(runner->cachedIni);
-        runner->cachedIni = nullptr;
+// Take a cached parsed INI for `path` out of its slot (caller owns both), or NULL.
+static IniFile* iniCacheTake(Runner* runner, const char* path, char** outPath) {
+    for (int i = 0; i < INI_CACHE_SLOTS; i++) {
+        if (runner->cachedIni[i] != nullptr && runner->cachedIniPath[i] != nullptr
+            && strcmp(runner->cachedIniPath[i], path) == 0) {
+            IniFile* ini = runner->cachedIni[i];
+            *outPath = runner->cachedIniPath[i];
+            runner->cachedIni[i] = nullptr;
+            runner->cachedIniPath[i] = nullptr;
+            return ini;
+        }
     }
-    free(runner->cachedIniPath);
-    runner->cachedIniPath = nullptr;
+    return NULL;
+}
+
+// Store a closed INI (ownership transfers). Reuses the slot with the same path,
+// then an empty slot, then evicts the oldest.
+static void iniCachePut(Runner* runner, IniFile* ini, char* path) {
+    int slot = -1;
+    for (int i = 0; i < INI_CACHE_SLOTS && slot < 0; i++)
+        if (runner->cachedIniPath[i] != nullptr && path != nullptr && strcmp(runner->cachedIniPath[i], path) == 0) slot = i;
+    for (int i = 0; i < INI_CACHE_SLOTS && slot < 0; i++)
+        if (runner->cachedIni[i] == nullptr) slot = i;
+    if (slot < 0) {
+        slot = 0;
+        for (int i = 1; i < INI_CACHE_SLOTS; i++)
+            if (runner->cachedIniAge[i] < runner->cachedIniAge[slot]) slot = i;
+    }
+    if (runner->cachedIni[slot] != nullptr) Ini_free(runner->cachedIni[slot]);
+    free(runner->cachedIniPath[slot]);
+    runner->cachedIni[slot] = ini;
+    runner->cachedIniPath[slot] = path;
+    runner->cachedIniAge[slot] = ++runner->cachedIniTick;
+}
+
+// Last-known canonical on-disk content of file-backed INIs. The game closes its
+// config INIs on EVERY save, and ini_close rewrote the whole file to the stick
+// (~100-600ms of FAT traffic) even when nothing changed. Comparing canonical
+// serializations lets an unchanged close skip the write entirely. Multi-slot for
+// the same reason as the parse cache (dr.ini and keyconfig_N.ini alternate).
+// Updated on every disk read/write of an INI; cleared on file_delete.
+#define INI_DISK_SLOTS 4
+static char* g_iniDiskPath[INI_DISK_SLOTS];
+static char* g_iniDiskText[INI_DISK_SLOTS];
+
+static int iniDiskFind(const char* path) {
+    for (int i = 0; i < INI_DISK_SLOTS; i++)
+        if (g_iniDiskPath[i] != nullptr && strcmp(g_iniDiskPath[i], path) == 0) return i;
+    return -1;
+}
+
+static void iniDiskRemember(const char* path, char* canonicalOwned) {
+    int slot = iniDiskFind(path);
+    if (slot < 0) {
+        for (int i = 0; i < INI_DISK_SLOTS && slot < 0; i++)
+            if (g_iniDiskPath[i] == nullptr) slot = i;
+    }
+    if (slot < 0) { // all busy: simple rotation
+        static int rr = 0;
+        slot = rr;
+        rr = (rr + 1) % INI_DISK_SLOTS;
+    }
+    free(g_iniDiskPath[slot]);
+    free(g_iniDiskText[slot]);
+    g_iniDiskPath[slot] = safeStrdup(path);
+    g_iniDiskText[slot] = canonicalOwned; // takes ownership
 }
 
 static RValue builtin_ini_open(VMContext* ctx, RValue* args, int32_t argCount) {
@@ -6903,29 +7147,60 @@ static RValue builtin_ini_open(VMContext* ctx, RValue* args, int32_t argCount) {
     runner->currentIniPath = nullptr;
 
     // Check if we have a cached INI for this path
-    if (runner->cachedIni != nullptr && runner->cachedIniPath != nullptr && strcmp(runner->cachedIniPath, path) == 0) {
-        runner->currentIni = runner->cachedIni;
-        runner->currentIniPath = runner->cachedIniPath;
-        runner->cachedIni = nullptr;
-        runner->cachedIniPath = nullptr;
-        runner->currentIniDirty = false;
-        return RValue_makeUndefined();
+    {
+        char* cachedPath = nullptr;
+        IniFile* cached = iniCacheTake(runner, path, &cachedPath);
+        if (cached != nullptr) {
+            runner->currentIni = cached;
+            runner->currentIniPath = cachedPath;
+            runner->currentIniDirty = false;
+            runner->currentIniReadFailed = false; // a cached ini is a parse that succeeded
+            return RValue_makeUndefined();
+        }
     }
 
-    // Cache miss, discard the old cache and read from disk
-    discardIniCache(runner);
-
+    // Cache miss: read from disk (other cached INIs stay cached)
     FileSystem* fs = runner->fileSystem;
 
     runner->currentIniPath = safeStrdup(path);
 
+#ifdef PLATFORM_PSP
+    // TEMP diag: the boot menu saw ini_open at ~200ms/call — split read vs parse.
+    extern void BsDiag_trace(const char* fmt, int a, int b);
+    extern long long sceKernelGetSystemTimeWide(void);
+    long long iniT0 = sceKernelGetSystemTimeWide();
+#endif
     char* content = fs->vtable->readFileText(fs, path);
+#ifdef PLATFORM_PSP
+    long long iniT1 = sceKernelGetSystemTimeWide();
+#endif
+    runner->currentIniReadFailed = false;
     if (content != nullptr) {
         runner->currentIni = Ini_parse(content);
         free(content);
+        // Remember the canonical form of what disk holds, so an unchanged ini_close
+        // can skip its stick write.
+        iniDiskRemember(path, Ini_serialize(runner->currentIni, INI_SERIALIZE_DEFAULT_INITIAL_CAPACITY));
     } else {
         runner->currentIni = Ini_parse("");
+        // An empty ini is the right answer for a file that does not exist -- ini_open on a new
+        // path is how a game creates one. It is the WRONG answer for a file that exists and
+        // could not be read: the game then writes its handful of keys onto a blank slate, and
+        // ini_close serialises just those over the real file. Every key the file held is gone.
+        //
+        // That is not hypothetical. DELTARUNE's scr_save writes name, level, room and time into
+        // dr.ini this way, and a save that lost the read came back showing nothing but its
+        // timestamp -- the one value written fresh rather than carried over.
+        //
+        // Worse, the failure is self-reinforcing: iniDiskRemember is skipped above, so the
+        // "unchanged, skip the write" check in ini_close cannot fire either, and the
+        // destructive write becomes certain rather than merely possible.
+        runner->currentIniReadFailed = fs->vtable->fileExists(fs, path);
     }
+#ifdef PLATFORM_PSP
+    BsDiag_trace("ini open read=%dus rest=%dus", (int) (iniT1 - iniT0),
+                 (int) (sceKernelGetSystemTimeWide() - iniT1));
+#endif
 
     runner->currentIniDirty = false;
 
@@ -6949,6 +7224,7 @@ static RValue builtin_ini_open_from_string(VMContext* ctx, RValue* args, int32_t
 
     runner->currentIni = Ini_parse(content);
     runner->currentIniDirty = false;
+    runner->currentIniReadFailed = false; // string-backed: nothing on disk to lose
 
     return RValue_makeUndefined();
 }
@@ -6965,18 +7241,40 @@ static RValue builtin_ini_close(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE
     // Serialize the current contents.
     char* serialized = Ini_serialize(runner->currentIni, INI_SERIALIZE_DEFAULT_INITIAL_CAPACITY);
 
-    // Write back to disk only for file-backed INIs (ini_open).
-    if (runner->currentIniDirty && runner->currentIniPath != nullptr) {
-        FileSystem* fs = runner->fileSystem;
-        fs->vtable->writeFileText(fs, runner->currentIniPath, serialized);
+    // Write back to disk only for file-backed INIs (ini_open) — and only when the
+    // content actually differs from what the disk already holds (the game "writes"
+    // its config on every save, almost always unchanged).
+    // currentIniReadFailed: the file is on disk but ini_open could not read it, so what is in
+    // memory is a blank stand-in, not the file. Writing it back would erase the file's real
+    // contents (see the note in ini_open). Leave the file alone -- a save the game believes it
+    // made is a smaller loss than a save the game destroys.
+    if (runner->currentIniDirty && runner->currentIniPath != nullptr && !runner->currentIniReadFailed) {
+        int diskSlot = iniDiskFind(runner->currentIniPath);
+        bool unchanged = diskSlot >= 0 && g_iniDiskText[diskSlot] != nullptr
+            && strcmp(g_iniDiskText[diskSlot], serialized) == 0;
+        if (!unchanged) {
+            FileSystem* fs = runner->fileSystem;
+            fs->vtable->writeFileText(fs, runner->currentIniPath, serialized);
+            iniDiskRemember(runner->currentIniPath, safeStrdup(serialized));
+        }
     }
 
-    // Move to cache instead of freeing
-    discardIniCache(runner);
-    runner->cachedIni = runner->currentIni;
-    runner->cachedIniPath = runner->currentIniPath;
+    if (runner->currentIniReadFailed) {
+#ifdef PLATFORM_PSP
+        extern void BsDiag_trace(const char* fmt, int a, int b);
+        BsDiag_trace("ini SKIPWRITE unreadable dirty=%d", runner->currentIniDirty ? 1 : 0, 0);
+#endif
+        // Not cached either: a blank stand-in in the cache would hand the same empty ini to the
+        // next ini_open, which could then write it with the guard already cleared.
+        Ini_free(runner->currentIni);
+        free(runner->currentIniPath);
+    } else {
+        // Move to cache instead of freeing
+        iniCachePut(runner, runner->currentIni, runner->currentIniPath);
+    }
     runner->currentIni = nullptr;
     runner->currentIniPath = nullptr;
+    runner->currentIniReadFailed = false;
 
     return RValue_makeOwnedString(serialized); // takes ownership of serialized
 }
@@ -7098,11 +7396,49 @@ static RValue builtin_directory_destroy(VMContext* ctx, RValue* args, int32_t ar
     return RValue_makeUndefined();
 }
 
+// Appends bytes to a write-mode text file's buffer in amortized O(1): tracks length and
+// capacity and grows the buffer geometrically, instead of strlen()+realloc on every call.
+// The old code did strlen(writeBuffer) + realloc per line, making a save of a ~20KB /
+// 10000-line DELTARUNE file O(n^2) — several seconds on the PSP's 333MHz CPU.
+// NOT static: the native scr_saveprocess fast-path (native_fastpath.c) appends
+// its ~20k save lines directly, skipping the per-line builtin call overhead.
+void fileTextAppend(OpenTextFile* file, const char* data, size_t addLen) {
+    size_t need = (size_t) file->writeLen + addLen + 1;
+    if (need > (size_t) file->writeCap) {
+        size_t cap = file->writeCap > 0 ? (size_t) file->writeCap : 64;
+        while (cap < need) cap *= 2;
+        file->writeBuffer = (char*) safeRealloc(file->writeBuffer, cap);
+        file->writeCap = (int32_t) cap;
+    }
+    memcpy(file->writeBuffer + file->writeLen, data, addLen);
+    file->writeLen += (int32_t) addLen;
+    file->writeBuffer[file->writeLen] = '\0';
+}
+
+#ifdef PLATFORM_PSP
+// The save file is read via ~10000 file_text_* calls; tracing each one made loading
+// take minutes (two ms0 writes per call). Log every 256th call with its file position —
+// the last logged (n,pos) brackets the death within a 256-call window.
+static int g_ftCalls = 0;
+static void ftMarkThrottled(Runner* runner, int32_t handle) {
+    g_ftCalls++;
+    if ((g_ftCalls & 0xFF) != 1) return;
+    int pos = -1;
+    if (handle >= 0 && handle < MAX_OPEN_TEXT_FILES && runner->openTextFiles[handle].isOpen)
+        pos = (int) runner->openTextFiles[handle].readPos;
+    BsDiag_traceHot("ft n=%d pos=%d", g_ftCalls, pos);
+}
+#define BFT_TICK(runner, handle) ftMarkThrottled(runner, handle)
+#else
+#define BFT_TICK(runner, handle)
+#endif
+
 static RValue builtin_file_text_open_read(VMContext* ctx, RValue* args, int32_t argCount) {
     if (1 > argCount) return RValue_makeReal(-1.0);
     const char* path = (args[0].type == RVALUE_STRING ? args[0].string : "");
     Runner* runner = ctx->runner;
     FileSystem* fs = runner->fileSystem;
+    BFT_MARK("ft openr");
 
     int32_t slot = findFreeTextFileSlot(runner);
     if (0 > slot) {
@@ -7111,6 +7447,7 @@ static RValue builtin_file_text_open_read(VMContext* ctx, RValue* args, int32_t 
     }
 
     char* content = fs->vtable->readFileText(fs, path);
+    BFT_MARK("ft openr read-done");
     if (content == nullptr) {
         // GML returns a valid handle even if the file doesn't exist; eof is immediately true
         content = safeStrdup("");
@@ -7130,6 +7467,7 @@ static RValue builtin_file_text_open_read(VMContext* ctx, RValue* args, int32_t 
 }
 
 static RValue builtin_file_text_open_write(VMContext* ctx, RValue* args, int32_t argCount) {
+    BFT_MARK("ft openw");
     if (1 > argCount) return RValue_makeReal(-1.0);
     const char* path = (args[0].type == RVALUE_STRING ? args[0].string : "");
     Runner* runner = ctx->runner;
@@ -7142,7 +7480,10 @@ static RValue builtin_file_text_open_write(VMContext* ctx, RValue* args, int32_t
 
     OpenTextFile file = {0};
     file.content = nullptr;
-    file.writeBuffer = safeStrdup("");
+    file.writeBuffer = (char*) safeMalloc(64);
+    file.writeBuffer[0] = '\0';
+    file.writeLen = 0;
+    file.writeCap = 64;
     file.filePath = safeStrdup(path);
     file.readPos = 0;
     file.contentLen = 0;
@@ -7154,6 +7495,7 @@ static RValue builtin_file_text_open_write(VMContext* ctx, RValue* args, int32_t
 }
 
 static RValue builtin_file_text_close(VMContext* ctx, RValue* args, int32_t argCount) {
+    BFT_MARK("ft close");
     if (1 > argCount) return RValue_makeUndefined();
     Runner* runner = ctx->runner;
     int32_t handle = RValue_toInt32(args[0]);
@@ -7176,6 +7518,7 @@ static RValue builtin_file_text_read_string(VMContext* ctx, RValue* args, int32_
     if (1 > argCount) return RValue_makeOwnedString(safeStrdup(""));
     Runner* runner = ctx->runner;
     int32_t handle = RValue_toInt32(args[0]);
+    BFT_TICK(runner, handle);
     if (0 > handle || handle >= MAX_OPEN_TEXT_FILES || !runner->openTextFiles[handle].isOpen) return RValue_makeOwnedString(safeStrdup(""));
 
     OpenTextFile* file = &runner->openTextFiles[handle];
@@ -7201,6 +7544,7 @@ static RValue builtin_file_text_readln(VMContext* ctx, RValue* args, int32_t arg
     if (1 > argCount) return RValue_makeOwnedString(safeStrdup(""));
     Runner* runner = ctx->runner;
     int32_t handle = RValue_toInt32(args[0]);
+    BFT_TICK(runner, handle);
     if (0 > handle || MAX_OPEN_TEXT_FILES <= handle || !runner->openTextFiles[handle].isOpen) return RValue_makeOwnedString(safeStrdup(""));
 
     OpenTextFile* file = &runner->openTextFiles[handle];
@@ -7237,10 +7581,23 @@ static RValue builtin_file_text_read_real(VMContext* ctx, RValue* args, int32_t 
     if (1 > argCount) return RValue_makeReal(0.0);
     Runner* runner = ctx->runner;
     int32_t handle = RValue_toInt32(args[0]);
+    BFT_TICK(runner, handle);
     if (0 > handle || handle >= MAX_OPEN_TEXT_FILES || !runner->openTextFiles[handle].isOpen) return RValue_makeReal(0.0);
 
     OpenTextFile* file = &runner->openTextFiles[handle];
     if (file->readPos >= file->contentLen) return RValue_makeReal(0.0);
+
+    // Fast path first: the save file is ~10k reals and strtod made loading/star-menu
+    // reads cost ~15us per value (see GMLReal_parseDecimalFast).
+    {
+        const char* fastEnd = nullptr;
+        bool fastOk = false;
+        GMLReal fastVal = GMLReal_parseDecimalFast(file->content + file->readPos, &fastEnd, &fastOk);
+        if (fastOk) {
+            file->readPos = (int32_t) (fastEnd - file->content);
+            return RValue_makeReal(fastVal);
+        }
+    }
 
     // strtod will parse the number and advance past it
     char* endPtr = nullptr;
@@ -7260,13 +7617,22 @@ static RValue builtin_file_text_write_string(VMContext* ctx, RValue* args, int32
 
     OpenTextFile* file = &runner->openTextFiles[handle];
     if (!file->isWriteMode) return RValue_makeUndefined();
+    BFT_TICK(runner, handle);
+
+    // Borrow string args / stack-format numbers: no malloc+free per written value.
+    if (args[1].type == RVALUE_STRING && args[1].string != nullptr) {
+        fileTextAppend(file, args[1].string, strlen(args[1].string));
+        return RValue_makeUndefined();
+    }
+    char nbuf[64];
+    int numLen = RValue_formatNumberToBuf(args[1], nbuf);
+    if (numLen >= 0) {
+        fileTextAppend(file, nbuf, (size_t) numLen);
+        return RValue_makeUndefined();
+    }
 
     char* str = RValue_toString(args[1]);
-    size_t oldLen = strlen(file->writeBuffer);
-    size_t addLen = strlen(str);
-    file->writeBuffer = (char *)safeRealloc(file->writeBuffer, oldLen + addLen + 1);
-    memcpy(file->writeBuffer + oldLen, str, addLen);
-    file->writeBuffer[oldLen + addLen] = '\0';
+    fileTextAppend(file, str, strlen(str));
     free(str);
 
     return RValue_makeUndefined();
@@ -7281,10 +7647,7 @@ static RValue builtin_file_text_writeln(VMContext* ctx, RValue* args, int32_t ar
     OpenTextFile* file = &runner->openTextFiles[handle];
     if (!file->isWriteMode) return RValue_makeUndefined();
 
-    size_t oldLen = strlen(file->writeBuffer);
-    file->writeBuffer = (char *)safeRealloc(file->writeBuffer, oldLen + 2);
-    file->writeBuffer[oldLen] = '\n';
-    file->writeBuffer[oldLen + 1] = '\0';
+    fileTextAppend(file, "\n", 1);
 
     return RValue_makeUndefined();
 }
@@ -7298,12 +7661,41 @@ static RValue builtin_file_text_write_real(VMContext* ctx, RValue* args, int32_t
     OpenTextFile* file = &runner->openTextFiles[handle];
     if (!file->isWriteMode) return RValue_makeUndefined();
 
+    // No-malloc fast path: a save writes ~20k reals; RValue_toString's snprintf +
+    // strdup + free pair made each call ~27us (seconds per save on the PSP).
+#ifdef PLATFORM_PSP
+    uint32_t ftwT0 = sceKernelGetSystemTimeLow(); // TEMP SAVE-PROFILE
+#endif
+    char nbuf[64];
+    int numLen = RValue_formatNumberToBuf(args[1], nbuf);
+    if (numLen >= 0) {
+#ifdef PLATFORM_PSP
+        uint32_t ftwT1 = sceKernelGetSystemTimeLow();
+#endif
+        // GameMaker writes a SPACE after the number, and that space is load-bearing. A line
+        // holding one value reads back the same either way, which is why this went unnoticed --
+        // but scr_saveprocess writes lists several values to a line (scr_ds_list_write), and
+        // without the separator "1" and "2" come back as "12". A DELTARUNE slot saved on console
+        // then loads as garbage: the file has the right 3055 lines, with values silently fused.
+        //
+        // Verified against a slot the real runtime wrote: every real in it is followed by a
+        // space ("1 ", "12107 "), and ours had none -- which is also why our saves came out at
+        // 6471 bytes against the same save's 12580 from the PC.
+        nbuf[numLen] = ' ';
+        fileTextAppend(file, nbuf, (size_t) numLen + 1);
+#ifdef PLATFORM_PSP
+        uint32_t ftwT2 = sceKernelGetSystemTimeLow();
+        g_ftwCalls++; g_ftwFmtUs += ftwT1 - ftwT0; g_ftwAppUs += ftwT2 - ftwT1; g_ftwTotalUs += ftwT2 - ftwT0;
+#endif
+        return RValue_makeUndefined();
+    }
+#ifdef PLATFORM_PSP
+    g_ftwNonNumeric++;
+#endif
+
     char* str = RValue_toString(args[1]);
-    size_t oldLen = strlen(file->writeBuffer);
-    size_t addLen = strlen(str);
-    file->writeBuffer = (char *)safeRealloc(file->writeBuffer, oldLen + addLen + 1);
-    memcpy(file->writeBuffer + oldLen, str, addLen);
-    file->writeBuffer[oldLen + addLen] = '\0';
+    fileTextAppend(file, str, strlen(str));
+    fileTextAppend(file, " ", 1); // same trailing space as the numeric path above
     free(str);
 
     return RValue_makeUndefined();
@@ -7319,10 +7711,60 @@ static RValue builtin_file_text_eof(VMContext* ctx, RValue* args, int32_t argCou
     return RValue_makeBool(file->readPos >= file->contentLen);
 }
 
+// file_copy(source, destination). It was never registered, which made it a silent no-op -- and
+// that is worse than a missing feature: DEVICE_MENU's slot-copy writes the destination's dr.ini
+// metadata FIRST and then calls this, so the copied slot LOOKS valid while its save file does not
+// exist. A player who trusts the copy and overwrites the original loses the run.
+static RValue builtin_file_copy(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (2 > argCount) return RValue_makeUndefined();
+    const char* src = (args[0].type == RVALUE_STRING ? args[0].string : "");
+    const char* dst = (args[1].type == RVALUE_STRING ? args[1].string : "");
+    if (src[0] == '\0' || dst[0] == '\0') return RValue_makeUndefined();
+
+    FileSystem* fs = ctx->runner->fileSystem;
+    void* in = fs->vtable->binaryOpen(fs, src, GML_FILE_BIN_READ);
+    if (in == nullptr) return RValue_makeUndefined();
+    void* out = fs->vtable->binaryOpen(fs, dst, GML_FILE_BIN_WRITE);
+    if (out == nullptr) { fs->vtable->binaryClose(fs, in); return RValue_makeUndefined(); }
+
+    // 8KB at a time: a save file is ~200KB of text and the stick is the slow part, but a buffer
+    // this size must not come off the 4KB-ish budget some threads run with -- hence the heap.
+    enum { COPY_CHUNK = 8 * 1024 };
+    uint8_t* buf = (uint8_t*) malloc(COPY_CHUNK);
+    if (buf != nullptr) {
+        for (;;) {
+            int32_t got = fs->vtable->binaryRead(fs, in, buf, COPY_CHUNK);
+            if (got <= 0) break;
+            int32_t put = fs->vtable->binaryWrite(fs, out, buf, got);
+            if (put != got) break;   // out of space or a stick error: stop rather than lie
+            if (got < COPY_CHUNK) break;
+        }
+        free(buf);
+    }
+    fs->vtable->binaryClose(fs, out);
+    fs->vtable->binaryClose(fs, in);
+    return RValue_makeUndefined();
+}
+
 static RValue builtin_file_delete(VMContext* ctx, RValue* args, int32_t argCount) {
     if (1 > argCount) return RValue_makeUndefined();
     const char* path = (args[0].type == RVALUE_STRING ? args[0].string : "");
     Runner* runner = ctx->runner;
+    // Deleting a tracked INI invalidates its disk snapshot (see iniDiskRemember)
+    // and its parsed cache slot.
+    {
+        int diskSlot = iniDiskFind(path);
+        if (diskSlot >= 0) {
+            free(g_iniDiskPath[diskSlot]); g_iniDiskPath[diskSlot] = nullptr;
+            free(g_iniDiskText[diskSlot]); g_iniDiskText[diskSlot] = nullptr;
+        }
+        char* cachedPath = nullptr;
+        IniFile* cached = iniCacheTake(runner, path, &cachedPath);
+        if (cached != nullptr) {
+            Ini_free(cached);
+            free(cachedPath);
+        }
+    }
     FileSystem* fs = runner->fileSystem;
     fs->vtable->deleteFile(fs, path);
     return RValue_makeUndefined();
@@ -7874,8 +8316,7 @@ static RValue builtin_game_restart(VMContext* ctx, MAYBE_UNUSED RValue* args, MA
 }
 
 static RValue builtin_game_end(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
-    Runner* runner = ctx->runner;
-    runner->shouldExit = true;
+    ctx->runner->shouldExit = true;
     return RValue_makeUndefined();
 }
 STUB_RETURN_UNDEFINED(game_save)
@@ -9503,6 +9944,13 @@ static RValue builtin_draw_sprite(VMContext* ctx, RValue* args, MAYBE_UNUSED int
     return RValue_makeUndefined();
 }
 
+// TEMP §2.118: non-zero while a STRUCT (a particle) is drawing, so the PSP backend can report
+// what happened to its quad. Lives here rather than in psp_renderer.c because the desktop and
+// PS2/PS3 targets link vm_builtins.c but not the PSP backend.
+int g_bsStructDraw = 0;
+// Name of the object running the with(struct) loop; set in handlePushEnv. See there for why.
+const char* g_bsStructOwner = "?";
+
 static RValue builtin_draw_sprite_ext(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
     Runner* runner = ctx->runner;
     if (runner->renderer == nullptr) return RValue_makeUndefined();
@@ -9521,7 +9969,71 @@ static RValue builtin_draw_sprite_ext(VMContext* ctx, RValue* args, MAYBE_UNUSED
         subimg = (int32_t) ctx->currentInstance->imageIndex;
     }
 
-    Renderer_drawSpriteExt(runner->renderer, spriteIndex, subimg, x, y, xscale, yscale, rot, color, alpha);
+    // TEMP §2.118: a sprite drawn from inside a STRUCT context is, in chapter 5, always a
+    // particle — obj_petal_burst's whole Draw is "with (particle_data[i]) draw_sprite_ext(...)".
+    // with(struct) now runs (confirmed on hardware) and the event costs up to 9ms a frame, yet
+    // no petal appears, so the argument values themselves are the thing left unmeasured. Three
+    // lines, then silence.
+    // One line per DISTINCT sprite, not per call: the first probe spent all three of its lines in
+    // the overworld on bush leaves (spr_bush_leaf_blue) and never reached the battle. Distinct
+    // sprites keep one line in reserve for whatever the fight actually draws — and a particle
+    // still carrying the constructor's default (spr_pxwhite, a 1x1 white pixel) would name itself.
+    if (ctx->currentInstance != nullptr
+        && ctx->currentInstance->objectIndex == STRUCT_OBJECT_INDEX) {
+        // Budget is per OWNING OBJECT, not per sprite: keying on sprite id spent all eight lines
+        // on the room's ambient petals (obj_petal_rain draws the same spr_bush_leaf art), so the
+        // battle's own emitter never got a line and "no structdraw for it" was indistinguishable
+        // from "it never drew". Two lines per owner answers the actual question: does
+        // obj_petal_burst reach draw_sprite_ext at all?
+        static const char* seenOwner[8];
+        static int seenOwnerHits[8];
+        static int ownerCount = 0;
+        static int32_t lastRoomSeen = -1;
+        int32_t roomNow = runner->currentRoomIndex;
+        if (roomNow != lastRoomSeen) { lastRoomSeen = roomNow; ownerCount = 0; }
+        int slot = -1;
+        for (int i = 0; i < ownerCount; i++) if (seenOwner[i] == g_bsStructOwner) { slot = i; break; }
+        if (slot < 0 && ownerCount < 8) {
+            slot = ownerCount++;
+            seenOwner[slot] = g_bsStructOwner;
+            seenOwnerHits[slot] = 0;
+        }
+        bool fresh = slot >= 0 && seenOwnerHits[slot] < 2;
+        if (fresh) {
+            seenOwnerHits[slot]++;
+            extern void BsDiag_trace(const char* fmt, int a, int b);
+            char dl[112];
+            // The camera goes in the same line: a particle with a valid sprite and full alpha
+            // that never appears is either outside the view or covered, and only the view can
+            // tell those apart. Everything else about these draws has already been measured
+            // correct (sprite, subimage, alpha, blend), so this is the last unmeasured thing.
+            GMLCamera* cam0 = Runner_getCameraById(runner, 0);
+            int camX = cam0 != nullptr ? (int) cam0->viewX : -1;
+            int camY = cam0 != nullptr ? (int) cam0->viewY : -1;
+            // SCALE, the one argument never measured. Sprite, subimage, alpha, blend colour,
+            // position and camera have all been checked correct on hardware, and the particles
+            // sit squarely inside the view — so a zero (or undefined-turned-zero) image_xscale
+            // is what a quad that costs time and covers no pixels looks like. x100 to keep the
+            // fractional part visible in an integer trace.
+            snprintf(dl, sizeof(dl), "structdraw %s spr=%d x=%d y=%d xs=%d a=%d cam=%d",
+                     g_bsStructOwner, (int) spriteIndex, (int) x, (int) y,
+                     (int) (xscale * 100.0f), (int) (alpha * 100.0f), camX);
+            (void) camY; (void) roomNow;
+            BsDiag_trace(dl, 0, 0);
+        }
+    }
+
+    // TEMP §2.118: mark the call as coming from a struct so the PSP backend can report what
+    // happened to the quad. Every ARGUMENT is now measured correct on hardware (sprite, subimage,
+    // position inside the view, scale 2.0, alpha 1.0, white) and the petals are still invisible,
+    // so the remaining unknown is downstream: tpag resolution, texture load, cull, screen rect.
+    {
+        extern int g_bsStructDraw;
+        g_bsStructDraw = (ctx->currentInstance != nullptr
+                          && ctx->currentInstance->objectIndex == STRUCT_OBJECT_INDEX) ? 1 : 0;
+        Renderer_drawSpriteExt(runner->renderer, spriteIndex, subimg, x, y, xscale, yscale, rot, color, alpha);
+        g_bsStructDraw = 0;
+    }
     return RValue_makeUndefined();
 }
 
@@ -9803,6 +10315,98 @@ static RValue builtin_draw_clear_alpha(VMContext* ctx, RValue* args, MAYBE_UNUSE
     return RValue_makeUndefined();
 }
 
+// ===[ Stubs for engine functions this port doesn't implement (Pizza Tower et al.) ]===
+// GM2 games call FMOD audio, particles, Steam, windowing helpers we don't have. Left
+// unresolved they return undefined, which STALLS game logic (Pizza Tower's intro cutscene
+// waits forever on fmod_event_instance_is_playing). These return sensible defaults so logic
+// progresses — the game just runs mute / without particles. Registered near the tile block.
+static RValue builtin_pt_stub_void(MAYBE_UNUSED VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    return RValue_makeUndefined();
+}
+static RValue builtin_pt_stub_zero(MAYBE_UNUSED VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    return RValue_makeReal(0);
+}
+static int32_t g_ptStubId = 0;
+static RValue builtin_pt_stub_id(MAYBE_UNUSED VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    return RValue_makeReal((GMLReal) (++g_ptStubId)); // fake non-zero handle
+}
+
+// ===[ date_* ]===
+// NOT stubs: DELTARUNE calls date_current_datetime() on EVERY save (scr_save writes it as
+// the "Date" field of dr.ini, the save-slot index the file menu reads). Stubbed to 0 it
+// wrote 1899-12-30 into every slot; unregistered it wrote the literal "undefined".
+// GameMaker's datetime is a real: whole part = days since 1899-12-30, fraction = time of day.
+#define GM_EPOCH_TO_UNIX_DAYS 25569 // days from 1899-12-30 to 1970-01-01
+// days_from_civil / civil_from_days (Howard Hinnant's algorithms): exact for any proleptic
+// Gregorian date, no lookup tables, no libc timezone handling.
+static int64_t daysFromCivil(int y, unsigned m, unsigned d) {
+    y -= m <= 2;
+    const int era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = (unsigned) (y - era * 400);
+    const unsigned doy = (153u * (m + (m > 2 ? -3 : 9)) + 2u) / 5u + d - 1u;
+    const unsigned doe = yoe * 365u + yoe / 4u - yoe / 100u + doy;
+    return (int64_t) era * 146097 + (int64_t) doe - 719468;
+}
+static void civilFromDays(int64_t z, int* y, unsigned* m, unsigned* d) {
+    z += 719468;
+    const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    const unsigned doe = (unsigned) (z - era * 146097);
+    const unsigned yoe = (doe - doe / 1460u + doe / 36524u - doe / 146096u) / 365u;
+    const int yy = (int) yoe + (int) era * 400;
+    const unsigned doy = doe - (365u * yoe + yoe / 4u - yoe / 100u);
+    const unsigned mp = (5u * doy + 2u) / 153u;
+    *d = doy - (153u * mp + 2u) / 5u + 1u;
+    *m = mp + (mp < 10u ? 3u : (unsigned) -9);
+    *y = yy + (*m <= 2u);
+}
+// Splits a GM datetime into its calendar parts. Negative fractions can't occur here (the
+// value we produce is always >= 0), so a plain floor on the day part is enough.
+static void gmDateSplit(double dt, int* y, unsigned* mo, unsigned* d, int* h, int* mi, int* s) {
+    double days = GMLReal_floor((GMLReal) dt);
+    double frac = dt - days;
+    if (frac < 0.0) frac = 0.0;
+    civilFromDays((int64_t) days - GM_EPOCH_TO_UNIX_DAYS, y, mo, d);
+    int secOfDay = (int) (frac * 86400.0 + 0.5);
+    if (secOfDay > 86399) secOfDay = 86399;
+    *h = secOfDay / 3600;
+    *mi = (secOfDay / 60) % 60;
+    *s = secOfDay % 60;
+}
+static RValue builtin_date_current_datetime(MAYBE_UNUSED VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+#ifdef PLATFORM_PSP
+    ScePspDateTime t;
+    if (sceRtcGetCurrentClockLocalTime(&t) == 0) {
+        int64_t days = daysFromCivil((int) t.year, (unsigned) t.month, (unsigned) t.day)
+                       + GM_EPOCH_TO_UNIX_DAYS;
+        double frac = ((double) t.hour * 3600.0 + (double) t.minute * 60.0 + (double) t.second) / 86400.0;
+        return RValue_makeReal((GMLReal) ((double) days + frac));
+    }
+    return RValue_makeReal(0);
+#else
+    time_t now = time(NULL);
+    if (now == (time_t) -1) return RValue_makeReal(0);
+    struct tm* lt = localtime(&now);
+    if (lt == NULL) return RValue_makeReal(0);
+    int64_t days = daysFromCivil(lt->tm_year + 1900, (unsigned) lt->tm_mon + 1u, (unsigned) lt->tm_mday)
+                   + GM_EPOCH_TO_UNIX_DAYS;
+    double frac = ((double) lt->tm_hour * 3600.0 + (double) lt->tm_min * 60.0 + (double) lt->tm_sec) / 86400.0;
+    return RValue_makeReal((GMLReal) ((double) days + frac));
+#endif
+}
+#define GM_DATE_PART(fnName, outVar) \
+    static RValue fnName(MAYBE_UNUSED VMContext* ctx, RValue* args, int32_t argCount) { \
+        if (argCount < 1) return RValue_makeReal(0); \
+        int y, h, mi, s; unsigned mo, d; \
+        gmDateSplit((double) RValue_toReal(args[0]), &y, &mo, &d, &h, &mi, &s); \
+        return RValue_makeReal((GMLReal) (outVar)); \
+    }
+GM_DATE_PART(builtin_date_get_year,   y)
+GM_DATE_PART(builtin_date_get_month,  (int) mo)
+GM_DATE_PART(builtin_date_get_day,    (int) d)
+GM_DATE_PART(builtin_date_get_hour,   h)
+GM_DATE_PART(builtin_date_get_minute, mi)
+GM_DATE_PART(builtin_date_get_second, s)
+
 static RValue builtin_draw_set_alpha(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
     Runner* runner = ctx->runner;
     if (runner->renderer != nullptr) {
@@ -9835,18 +10439,30 @@ static RValue builtin_draw_set_valign(VMContext* ctx, RValue* args, MAYBE_UNUSED
     return RValue_makeUndefined();
 }
 
+// Borrow fast path for the draw_text* family: a STRING argument's pointer goes to
+// the renderer directly (the draw path never stores it past the call). The battle
+// writer draws one draw_text_color PER CHARACTER — 63/frame at a full textbox —
+// and the strdup+free pair per call was most of its measured ~50us. Non-string
+// values still take the formatting path; *owned is what the caller must free.
+static inline const char* drawTextBorrowArg(RValue v, char** owned) {
+    if (v.type == RVALUE_STRING) { *owned = nullptr; return v.string != nullptr ? v.string : ""; }
+    *owned = RValue_toString(v);
+    return *owned;
+}
+
 static RValue builtin_draw_text(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
     Runner* runner = ctx->runner;
     if (runner->renderer == nullptr) return RValue_makeUndefined();
 
     float x = (float) RValue_toReal(args[0]);
     float y = (float) RValue_toReal(args[1]);
-    char* str = RValue_toString(args[2]);
+    char* strOwned;
+    const char* str = drawTextBorrowArg(args[2], &strOwned);
 
     PreprocessedText processedText = TextUtils_preprocessGmlTextIfNeeded(runner, str);
     runner->renderer->vtable->drawText(runner->renderer, processedText.text, x, y, 1.0f, 1.0f, 0.0f, -1.0f);
     PreprocessedText_free(processedText);
-    free(str);
+    free(strOwned);
     return RValue_makeUndefined();
 }
 
@@ -9856,7 +10472,8 @@ static RValue builtin_draw_text_transformed(VMContext* ctx, RValue* args, MAYBE_
 
     float x = (float) RValue_toReal(args[0]);
     float y = (float) RValue_toReal(args[1]);
-    char* str = RValue_toString(args[2]);
+    char* strOwned;
+    const char* str = drawTextBorrowArg(args[2], &strOwned);
     float xscale = (float) RValue_toReal(args[3]);
     float yscale = (float) RValue_toReal(args[4]);
     float angle = (float) RValue_toReal(args[5]);
@@ -9864,7 +10481,7 @@ static RValue builtin_draw_text_transformed(VMContext* ctx, RValue* args, MAYBE_
     PreprocessedText processedText = TextUtils_preprocessGmlTextIfNeeded(runner, str);
     runner->renderer->vtable->drawText(runner->renderer, processedText.text, x, y, xscale, yscale, angle, -1.0f);
     PreprocessedText_free(processedText);
-    free(str);
+    free(strOwned);
     return RValue_makeUndefined();
 }
 
@@ -9898,12 +10515,13 @@ static RValue builtin_draw_text_ext(VMContext* ctx, RValue* args, MAYBE_UNUSED i
 
     float x = (float) RValue_toReal(args[0]);
     float y = (float) RValue_toReal(args[1]);
-    char* str = RValue_toString(args[2]);
+    char* strOwned;
+    const char* str = drawTextBorrowArg(args[2], &strOwned);
     int32_t separation = RValue_toInt32(args[3]);
     int32_t width = RValue_toInt32(args[4]);
 
     drawTextExtCommon(runner, str, x, y, 1.0f, 1.0f, 0.0f, separation, width);
-    free(str);
+    free(strOwned);
     return RValue_makeUndefined();
 }
 
@@ -9913,7 +10531,8 @@ static RValue builtin_draw_text_ext_transformed(VMContext* ctx, RValue* args, MA
 
     float x = (float) RValue_toReal(args[0]);
     float y = (float) RValue_toReal(args[1]);
-    char* str = RValue_toString(args[2]);
+    char* strOwned;
+    const char* str = drawTextBorrowArg(args[2], &strOwned);
     int32_t separation = RValue_toInt32(args[3]);
     int32_t width = RValue_toInt32(args[4]);
     float xscale = (float) RValue_toReal(args[5]);
@@ -9921,7 +10540,7 @@ static RValue builtin_draw_text_ext_transformed(VMContext* ctx, RValue* args, MA
     float angle = (float) RValue_toReal(args[7]);
 
     drawTextExtCommon(runner, str, x, y, xscale, yscale, angle, separation, width);
-    free(str);
+    free(strOwned);
     return RValue_makeUndefined();
 }
 
@@ -9931,7 +10550,8 @@ static RValue builtin_draw_text_color(VMContext* ctx, RValue* args, MAYBE_UNUSED
 
     float x = (float) RValue_toReal(args[0]);
     float y = (float) RValue_toReal(args[1]);
-    char* str = RValue_toString(args[2]);
+    char* strOwned;
+    const char* str = drawTextBorrowArg(args[2], &strOwned);
     int32_t c1 = RValue_toInt32(args[3]);
     int32_t c2 = RValue_toInt32(args[4]);
     int32_t c3 = RValue_toInt32(args[5]);
@@ -9941,7 +10561,7 @@ static RValue builtin_draw_text_color(VMContext* ctx, RValue* args, MAYBE_UNUSED
     PreprocessedText processedText = TextUtils_preprocessGmlTextIfNeeded(runner, str);
     runner->renderer->vtable->drawTextColor(runner->renderer, processedText.text, x, y, 1.0f, 1.0f, 0.0f, c1, c2, c3, c4, alpha, -1.0f);
     PreprocessedText_free(processedText);
-    free(str);
+    free(strOwned);
     return RValue_makeUndefined();
 }
 
@@ -9951,7 +10571,8 @@ static RValue builtin_draw_text_color_transformed(VMContext* ctx, RValue* args, 
 
     float x = (float) RValue_toReal(args[0]);
     float y = (float) RValue_toReal(args[1]);
-    char* str = RValue_toString(args[2]);
+    char* strOwned;
+    const char* str = drawTextBorrowArg(args[2], &strOwned);
     float xscale = (float) RValue_toReal(args[3]);
     float yscale = (float) RValue_toReal(args[4]);
     float angle = (float) RValue_toReal(args[5]);
@@ -9964,7 +10585,7 @@ static RValue builtin_draw_text_color_transformed(VMContext* ctx, RValue* args, 
     PreprocessedText processedText = TextUtils_preprocessGmlTextIfNeeded(runner, str);
     runner->renderer->vtable->drawTextColor(runner->renderer, processedText.text, x, y, xscale, yscale, angle, c1, c2, c3, c4, alpha, -1.0f);
     PreprocessedText_free(processedText);
-    free(str);
+    free(strOwned);
     return RValue_makeUndefined();
 }
 
@@ -9987,7 +10608,8 @@ static RValue builtin_draw_text_color_ext(VMContext* ctx, RValue* args, MAYBE_UN
 
     float x = (float) RValue_toReal(args[0]);
     float y = (float) RValue_toReal(args[1]);
-    char* str = RValue_toString(args[2]);
+    char* strOwned;
+    const char* str = drawTextBorrowArg(args[2], &strOwned);
     int32_t separation = RValue_toInt32(args[3]);
     int32_t width = RValue_toInt32(args[4]);
     int32_t c1 = RValue_toInt32(args[5]);
@@ -9997,7 +10619,7 @@ static RValue builtin_draw_text_color_ext(VMContext* ctx, RValue* args, MAYBE_UN
     float alpha = (float) RValue_toReal(args[9]);
 
     drawTextColorExtCommon(runner, str, x, y, 1.0f, 1.0f, 0.0f, separation, width, c1, c2, c3, c4, alpha);
-    free(str);
+    free(strOwned);
     return RValue_makeUndefined();
 }
 
@@ -10007,7 +10629,8 @@ static RValue builtin_draw_text_color_ext_transformed(VMContext* ctx, RValue* ar
 
     float x = (float) RValue_toReal(args[0]);
     float y = (float) RValue_toReal(args[1]);
-    char* str = RValue_toString(args[2]);
+    char* strOwned;
+    const char* str = drawTextBorrowArg(args[2], &strOwned);
     int32_t separation = RValue_toInt32(args[3]);
     int32_t width = RValue_toInt32(args[4]);
     float xscale = (float) RValue_toReal(args[5]);
@@ -10020,7 +10643,7 @@ static RValue builtin_draw_text_color_ext_transformed(VMContext* ctx, RValue* ar
     float alpha = (float) RValue_toReal(args[12]);
 
     drawTextColorExtCommon(runner, str, x, y, xscale, yscale, angle, separation, width, c1, c2, c3, c4, alpha);
-    free(str);
+    free(strOwned);
     return RValue_makeUndefined();
 }
 
@@ -10448,6 +11071,27 @@ static RValue builtin_draw_get_valign(VMContext* ctx, MAYBE_UNUSED RValue* args,
     return RValue_makeInt32(-1);
 }
 
+// motion_set is motion_add's twin that REPLACES the velocity instead of accumulating it. It was
+// simply missing, so ch5 content that sets motion this way (dashbar shrapnel, kikky's lunge)
+// spawned frozen at speed 0.
+static RValue builtin_motion_set(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (!g_newBuiltinsEnabled) return RValue_makeUndefined(); // bisect switch, see the registration site
+    if (2 > argCount) return RValue_makeUndefined();
+
+    Instance* inst = ctx->currentInstance;
+    if (inst == nullptr) return RValue_makeUndefined();
+
+    GMLReal dir = RValue_toReal(args[0]);
+    GMLReal spd = RValue_toReal(args[1]);
+    GMLReal rad = dir * (M_PI / 180.0);
+
+    inst->hspeed = (float) (GMLReal_cos(rad) * spd);
+    inst->vspeed = (float) (-GMLReal_sin(rad) * spd);
+    Instance_computeSpeedFromComponents(inst);
+
+    return RValue_makeUndefined();
+}
+
 static RValue builtin_motion_add(VMContext* ctx, RValue* args, int32_t argCount) {
     if (2 > argCount) return RValue_makeUndefined();
 
@@ -10478,6 +11122,23 @@ static RValue builtin_surface_create(VMContext* ctx, RValue* args, MAYBE_UNUSED 
     int32_t height = (int32_t) RValue_toReal(args[1]);
     Runner* runner = ctx->runner;
     if (runner->renderer != nullptr) {
+        // Name the ASKER. The renderer only ever saw a size, so a pool that ran dry could say
+        // "DENIED req=343025" and nothing about whose effect just died — and on PSP the pool
+        // does run dry (a battle filled 983040 bytes with eleven surfaces and then refused
+        // twenty-eight more, one of which was the TP bar at 8KB). This line sits immediately
+        // before the renderer's own, so the two read as one record.
+        {
+            extern void BsDiag_trace(const char* fmt, int a, int b);
+            Instance* inst = (Instance*) ctx->currentInstance;
+            const char* who = "?";
+            if (inst != nullptr && inst->objectIndex >= 0
+                && (uint32_t) inst->objectIndex < ctx->dataWin->objt.count) {
+                who = ctx->dataWin->objt.objects[inst->objectIndex].name;
+            }
+            char dl[96];
+            snprintf(dl, sizeof(dl), "surf ask %s req=%d", who, (int) (width * 1000 + height));
+            BsDiag_trace(dl, 0, 0);
+        }
         int32_t surfaceId = Renderer_createSurface(runner->renderer, width,height);
         return RValue_makeReal(surfaceId);
     }
@@ -11212,8 +11873,18 @@ static RValue builtin_place_meeting(VMContext* ctx, RValue* args, int32_t argCou
     int32_t target = VM_resolveInstanceTarget(ctx, RValue_toInt32(args[2]));
     if (target == INSTANCE_NOONE) return RValue_makeBool(false);
 
+#ifdef PLATFORM_PSP
+    // COLPROF times EVERY place_meeting — three syscalls per call, and the game leans on
+    // it hard in bullet-hell phases. Only pay it when the reader (diag=full) is listening.
+    extern int g_bsDiagLevel;
+    const bool colProf = g_bsDiagLevel >= 2;
+    long long colT0 = colProf ? sceKernelGetSystemTimeWide() : 0; // TEMP COLPROF
+#endif
     // ALWAYS SYNC THE GRID BEFORE CHANGING THE INSTANCE POSITION TO AVOID "SYNCING" THE TEST POSITION!
     SpatialGrid_syncGrid(runner, runner->spatialGrid);
+#ifdef PLATFORM_PSP
+    long long colT1 = colProf ? sceKernelGetSystemTimeWide() : 0;
+#endif
 
     // Save current position and temporarily move to test position
     GMLReal savedX = caller->x;
@@ -11236,10 +11907,22 @@ static RValue builtin_place_meeting(VMContext* ctx, RValue* args, int32_t argCou
                     if (!other->active || other == caller) continue;
                     if (other->lastCollisionQueryId == query.queryId) continue;
                     other->lastCollisionQueryId = query.queryId;
+#ifdef PLATFORM_PSP
+                    g_colCand++;
+#endif
 
                     if (!query.matchAll && query.filterByObject && !VM_isObjectOrDescendant(runner->dataWin, other->objectIndex, target)) continue;
                     if (!query.matchAll && query.filterByInstanceId && other->instanceId != (uint32_t) target) continue;
 
+#ifdef PLATFORM_PSP
+                    g_colBBox++;
+                    if (g_colPreciseObj < 0) {
+                        if (Collision_hasFrameMasks(Collision_getSprite(runner->dataWin, other)))
+                            g_colPreciseObj = other->objectIndex;
+                        else if (Collision_hasFrameMasks(Collision_getSprite(runner->dataWin, caller)))
+                            g_colPreciseObj = caller->objectIndex;
+                    }
+#endif
                     InstanceBBox otherBBox = Collision_computeBBox(runner, other);
                     if (!otherBBox.valid) continue;
 
@@ -11256,6 +11939,13 @@ static RValue builtin_place_meeting(VMContext* ctx, RValue* args, int32_t argCou
     caller->x = savedX;
     caller->y = savedY;
 
+#ifdef PLATFORM_PSP
+    if (colProf) {
+        g_colCalls++;
+        g_colSyncUs += (unsigned int) (colT1 - colT0);
+        g_colTotalUs += (unsigned int) (sceKernelGetSystemTimeWide() - colT0);
+    }
+#endif
     return RValue_makeBool(found);
 }
 
@@ -12709,6 +13399,32 @@ static RValue builtin_tile_layer_shift(MAYBE_UNUSED VMContext* ctx, RValue* args
     return RValue_makeUndefined();
 }
 
+// Lazy instanceID -> tile index map for tile_set_alpha. The scan version was
+// O(tileCount) per call; the dark-world darkening (obj_dancer_gen) calls tile_set_alpha
+// for EVERY tile at a depth on EVERY fade frame, i.e. O(tileCount^2)/frame — a measured
+// ~9ms single-frame spike in the dancers room, and the same effect recurs across the
+// chapter. The map rebuilds only when the tile array changes (room load, or explicit
+// invalidation from tile_add/tile_delete below), so lookups amortise to O(1).
+// Main-thread only (VM), so the malloc is safe.
+static Room* s_tileIdxRoom = nullptr;
+static RoomTile* s_tileIdxTiles = nullptr; // detects payload reload (same Room*, new tiles array)
+static struct { uint32_t key; int32_t value; }* s_tileIdxMap = nullptr;
+static void tileIndexInvalidate(void) { s_tileIdxRoom = nullptr; } // in-place tile mutation
+static int32_t tileIndexById(Room* room, uint32_t id) {
+    // Rebuild on a different room, a reallocated tile array (payload reload / tile_add),
+    // or an explicit invalidation (in-place shift from tile_delete leaves the pointer).
+    if (s_tileIdxRoom != room || s_tileIdxTiles != room->tiles) {
+        hmfree(s_tileIdxMap);
+        s_tileIdxMap = nullptr;
+        for (uint32_t i = 0; i < room->tileCount; i++)
+            hmput(s_tileIdxMap, room->tiles[i].instanceID, (int32_t) i);
+        s_tileIdxRoom = room;
+        s_tileIdxTiles = room->tiles;
+    }
+    ptrdiff_t k = hmgeti(s_tileIdxMap, id);
+    return k >= 0 ? s_tileIdxMap[k].value : -1;
+}
+
 // tile_add(background, left, top, width, height, x, y, depth) - creates a new tile in the current room and returns its id.
 static RValue builtin_tile_add(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
     Runner* runner = ctx->runner;
@@ -12740,6 +13456,7 @@ static RValue builtin_tile_add(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_
     tile->color = 0xFFFFFFFFu;
     tile->alpha = 1.0f;
     room->tileCount = newCount;
+    tileIndexInvalidate(); // tiles reallocated/appended
 
     runner->drawableListStructureDirty = true;
     return RValue_makeReal((GMLReal) newId);
@@ -12792,7 +13509,7 @@ static RValue builtin_tile_layer_delete(VMContext* ctx, RValue* args, MAYBE_UNUS
         write++;
     }
     room->tileCount = write;
-    if (removedAny) runner->drawableListStructureDirty = true;
+    if (removedAny) { runner->drawableListStructureDirty = true; tileIndexInvalidate(); }
     return RValue_makeUndefined();
 }
 
@@ -12807,6 +13524,7 @@ static RValue builtin_tile_delete(VMContext* ctx, RValue* args, MAYBE_UNUSED int
         uint32_t tailLen = room->tileCount - i - 1;
         if (tailLen > 0) memmove(&room->tiles[i], &room->tiles[i + 1], tailLen * sizeof(RoomTile));
         room->tileCount--;
+        tileIndexInvalidate(); // in-place shift changed indices (pointer unchanged)
         runner->drawableListStructureDirty = true;
         return RValue_makeUndefined();
     }
@@ -12821,9 +13539,9 @@ static RValue builtin_tile_set_alpha(VMContext* ctx, RValue* args, MAYBE_UNUSED 
     if (room == nullptr) return RValue_makeUndefined();
     uint32_t id = (uint32_t) RValue_toInt32(args[0]);
     float alpha = (float) RValue_toReal(args[1]);
-    repeat(room->tileCount, i) {
-        if (room->tiles[i].instanceID != id) continue;
-        room->tiles[i].alpha = alpha;
+    int32_t idx = tileIndexById(room, id);
+    if (idx >= 0) {
+        room->tiles[idx].alpha = alpha;
         return RValue_makeUndefined();
     }
     fprintf(stderr, "VM: tile_set_alpha: tile does not exist (%u)\n", id);
@@ -12883,13 +13601,13 @@ static int32_t resolveLayerIdArg(Runner* runner, RValue arg) {
         size_t runtimeLayerCount = arrlenu(runner->runtimeLayers);
         repeat(runtimeLayerCount, i) {
             RuntimeLayer* rl = &runner->runtimeLayers[i];
-            if (rl->dynamic && strcmp(rl->dynamicName, name) == 0)
+            if (rl->dynamic && rl->dynamicName != nullptr && strcasecmp(rl->dynamicName, name) == 0)
                 return (int32_t) rl->id;
         }
         if (runner->currentRoom != nullptr) {
             repeat(runner->currentRoom->layerCount, i) {
                 RoomLayer* layer = &runner->currentRoom->layers[i];
-                if (layer->name != nullptr && strcmp(layer->name, name) == 0)
+                if (layer->name != nullptr && strcasecmp(layer->name, name) == 0)
                     return (int32_t) layer->id;
             }
         }
@@ -12946,7 +13664,7 @@ static RValue builtin_layer_get_id(VMContext* ctx, RValue* args, MAYBE_UNUSED in
     size_t runtimeLayerCount = arrlenu(runner->runtimeLayers);
     repeat(runtimeLayerCount, i) {
         RuntimeLayer* runtimeLayer = &runner->runtimeLayers[i];
-        if (runtimeLayer->dynamic && strcmp(runtimeLayer->dynamicName, name) == 0) {
+        if (runtimeLayer->dynamic && runtimeLayer->dynamicName != nullptr && strcasecmp(runtimeLayer->dynamicName, name) == 0) {
             result = (int32_t) runtimeLayer->id;
             break;
         }
@@ -12954,7 +13672,7 @@ static RValue builtin_layer_get_id(VMContext* ctx, RValue* args, MAYBE_UNUSED in
     if (result == -1 && runner->currentRoom != nullptr) {
         repeat(runner->currentRoom->layerCount, i) {
             RoomLayer* layer = &runner->currentRoom->layers[i];
-            if (layer->name != nullptr && strcmp(layer->name, name) == 0) {
+            if (layer->name != nullptr && strcasecmp(layer->name, name) == 0) {
                 result = (int32_t) layer->id;
                 break;
             }
@@ -13148,12 +13866,22 @@ static RValue builtin_layer_destroy(VMContext* ctx, RValue* args, MAYBE_UNUSED i
         if ((int32_t) runner->runtimeLayers[i].id != id)
             continue;
 
-        // Ignore if we are trying to delete a non-dynamic layer
-        if (!runner->runtimeLayers[i].dynamic)
-            return RValue_makeUndefined();
+        // GameMaker allows destroying room-defined layers at runtime.
+        // When destroying an instance layer, destroy the instances bound to that layer.
+        // (Backport of upstream PR #339: without this a destroyed instance layer — e.g. the
+        // town festival's INSTANCES_LAMPS before stage 3 — keeps its instances alive forever.)
+        size_t elementCount = arrlenu(runner->runtimeLayers[i].elements);
+        repeat(elementCount, j) {
+            RuntimeLayerElement* el = &runner->runtimeLayers[i].elements[j];
+            if (el->type != RuntimeLayerElementType_Instance) continue;
+            Instance* inst = hmget(runner->instancesById, el->instanceId);
+            if (inst == nullptr || inst->destroyed) continue;
+            Runner_destroyInstance(runner, inst, true);
+        }
 
         Runner_freeRuntimeLayer(&runner->runtimeLayers[i]);
         arrdel(runner->runtimeLayers, i);
+
         runner->drawableListStructureDirty = true;
         break;
     }
@@ -13996,6 +14724,26 @@ static RValue builtin_tilemap_set_at_pixel(VMContext* ctx, RValue* args, MAYBE_U
 
 // tilemap_get_tileset(tilemapElementId): returns the BGND (tileset) index backing the tilemap, or -1.
 // (see GameMaker-HTML5 Function_Layers.js tilemap_get_tileset)
+// draw_tile(tileset, tiledata, frame, x, y): draws a SINGLE tile of a tileset at room
+// coordinates, honouring the cell's mirror/flip bits and -- unlike a tile layer -- the current
+// draw colour and alpha, which is the whole reason a game reaches for it. DELTARUNE Chapter 5
+// lights its grass this way: obj_gardenlight redraws the tiles within three cells of itself at
+// a lower alpha, so the ground brightens as the party walks past.
+//
+// The cell decode is Runner_drawTileLayer's, kept in step through the masks in runner.h.
+//
+// "frame" selects the frame of an ANIMATED tileset. Tile animation is not modelled in this
+// runner at all -- Runner_drawTileLayer ignores it too, and tilemap_get_frame() below answers 0
+// for every layer -- so a static tileset draws identically whatever is passed here.
+// tilemap_get_frame(tilemapElementId): which frame of an animated tileset the layer is showing.
+// Nothing in this runner advances tile animation, so every layer sits on frame 0 -- the frame
+// Runner_drawTileLayer and draw_tile() both draw.
+static RValue builtin_tilemap_get_frame(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    if (1 > argCount) return RValue_makeReal(0.0);
+    (void) findTilemapData(ctx->runner, RValue_toInt32(args[0]), nullptr);
+    return RValue_makeReal(0.0);
+}
+
 static RValue builtin_tilemap_get_tileset(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
     if (1 > argCount) return RValue_makeReal(-1.0);
     RoomLayerTilesData* data = findTilemapData(ctx->runner, RValue_toInt32(args[0]), nullptr);
@@ -14035,6 +14783,34 @@ static RValue builtin_tile_get_rotate(MAYBE_UNUSED VMContext* ctx, RValue* args,
 static RValue builtin_tile_set_empty(MAYBE_UNUSED VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
     if (1 > argCount) return RValue_makeReal(-1.0);
     return RValue_makeReal((GMLReal) (RValue_toInt32(args[0]) & ~TILEINDEX_SHIFTEDMASK));
+}
+
+// tile_set_mirror/flip/rotate(tiledata, enable): set or clear one transform bit on a raw cell
+// value. The getters have been here all along; the setters are what a script needs to build a
+// MIRRORED copy of a tilemap, which is how the reflections are made.
+// (see GameMaker-HTML5 Function_Layers.js; backported from upstream 6773a18)
+static RValue builtin_tile_set_mirror(MAYBE_UNUSED VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    if (2 > argCount) return RValue_makeReal(-1.0);
+    int32_t cell = RValue_toInt32(args[0]);
+    if (RValue_toBool(args[1])) cell |= TILEMIRROR_MASK;
+    else cell &= ~TILEMIRROR_MASK;
+    return RValue_makeReal((GMLReal) cell);
+}
+
+static RValue builtin_tile_set_flip(MAYBE_UNUSED VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    if (2 > argCount) return RValue_makeReal(-1.0);
+    int32_t cell = RValue_toInt32(args[0]);
+    if (RValue_toBool(args[1])) cell |= TILEFLIP_MASK;
+    else cell &= ~TILEFLIP_MASK;
+    return RValue_makeReal((GMLReal) cell);
+}
+
+static RValue builtin_tile_set_rotate(MAYBE_UNUSED VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    if (2 > argCount) return RValue_makeReal(-1.0);
+    int32_t cell = RValue_toInt32(args[0]);
+    if (RValue_toBool(args[1])) cell |= TILEROTATE_MASK;
+    else cell &= ~TILEROTATE_MASK;
+    return RValue_makeReal((GMLReal) cell);
 }
 
 static RValue builtin_layer_get_all(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
@@ -14885,6 +15661,9 @@ static RValue builtin_mp_grid_path(VMContext* ctx, RValue* args, int32_t argCoun
     pPath->internalPoints = nullptr;
     pPath->internalPointCount = 0;
     pPath->length = 0.0f;
+    pPath->isSmooth = false;
+    pPath->isClosed = false;
+
     GamePath_computeInternal(pPath);
 
     return RValue_makeBool(true);
@@ -15570,7 +16349,7 @@ static RValue fontAddSpriteImpl(VMContext* ctx, int32_t spriteIndex, uint16_t* c
     Font* font = &dw->font.fonts[newFontIndex];
     font->name = "sprite_font";
     font->displayName = "sprite_font";
-    font->emSize = (maxHeight > 0) ? maxHeight : sprite->height;
+    font->emSize = (float) ((maxHeight > 0) ? maxHeight : sprite->height);
     font->bold = false;
     font->italic = false;
     font->rangeStart = 0;
@@ -15604,6 +16383,15 @@ static RValue builtin_font_get_name(VMContext* ctx, RValue* args, int32_t argCou
     int32_t fontIndex = RValue_toInt32(args[0]);
     if (0 > fontIndex || (uint32_t) fontIndex >= ctx->dataWin->font.count) return RValue_makeUndefined();
     return RValue_makeString(ctx->dataWin->font.fonts[fontIndex].name);
+}
+
+// font_get_size(font): the font's em size. Real, not integer -- newer GameMaker stores it as a
+// pixel size with a fractional part. Backported from upstream 46d5b77.
+static RValue builtin_font_get_size(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (1 > argCount) return RValue_makeUndefined();
+    int32_t fontIndex = RValue_toInt32(args[0]);
+    if (0 > fontIndex || (uint32_t) fontIndex >= ctx->dataWin->font.count) return RValue_makeUndefined();
+    return RValue_makeReal(ctx->dataWin->font.fonts[fontIndex].emSize);
 }
 
 // font_get_info(font): returns a struct with the font information.
@@ -15882,6 +16670,20 @@ static RValue builtin_shader_current(VMContext* ctx, MAYBE_UNUSED RValue* args, 
     return RValue_makeReal(-1);
 }
 
+// DELTARUNE ch3+ ships a native extension (shader_replace_simple_x64.dll) that
+// swaps fragment shaders at runtime. There is no DLL to call on console targets;
+// without a stub every call takes the unknown-function slow path (name lookups +
+// a trace line) dozens of times per frame in shader-heavy rooms.
+static RValue builtin_shader_replace_simple_stub(MAYBE_UNUSED VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    return RValue_makeReal(0.0);
+}
+
+// Returns the texture page IDs backing a texture group. Only used by DELTARUNE
+// for cache prewarming; an empty array keeps those loops trivially correct.
+static RValue builtin_texturegroup_get_textures(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    return RValue_makeArray(GMLArray_create(ctx->dataWin->gen8.wadVersion, 0));
+}
+
 static RValue builtin_shader_is_compiled(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
     int32_t ShaderID = (int32_t) RValue_toReal(args[0]);
     return RValue_makeBool(ctx->runner->renderer->vtable->shaderIsCompiled(ctx->runner->renderer, ShaderID));
@@ -16129,7 +16931,396 @@ static RValue builtin_sprite_get_info(VMContext* ctx, RValue* args, int32_t argC
     VM_structSetAndFreeVal(ctx, ret, "frame_speed", RValue_makeReal(sprite->gms2PlaybackSpeed), -1);
     VM_structSetAndFreeVal(ctx, ret, "frame_type", RValue_makeReal(sprite->gms2PlaybackSpeedType), -1);
 
+    // Per-frame crop data, straight out of the sprite's TPAG entries. DELTARUNE builds every
+    // cast shadow from this array: draw_shadowcast reads frames[i].w/.h/.x_offset/.y_offset to
+    // lay out the skewed quad it hands to draw_sprite_pos. Leaving it undefined made every
+    // shadow come out zero-width, so obj_sunshadows dutifully composited an empty mask and the
+    // entire shadow system drew nothing at all — with no error anywhere to say so.
+    // Callers cache the result per sprite (obj_sunshadows.shadow_spritecache), so building the
+    // structs here is paid once per sprite rather than per draw.
+    GMLArray* frames = GMLArray_create(ctx->dataWin->gen8.wadVersion, (int32_t) sprite->textureCount);
+    for (uint32_t i = 0; i < sprite->textureCount; i++) {
+        int32_t tpagIndex = sprite->tpagIndices != nullptr ? sprite->tpagIndices[i] : -1;
+        bool ok = tpagIndex >= 0 && (uint32_t) tpagIndex < ctx->dataWin->tpag.count;
+        TexturePageItem* tp = ok ? &ctx->dataWin->tpag.items[tpagIndex] : nullptr;
+        Instance* fr = Runner_createStruct(ctx->runner);
+        // x/y/w/h describe the frame's rectangle on its texture page; x_offset/y_offset are
+        // where that (cropped) rectangle sits inside the full sprite, which is what the shadow
+        // maths needs to put the silhouette under the character's feet rather than its origin.
+        VM_structSetAndFreeVal(ctx, fr, "x", RValue_makeReal(tp ? tp->sourceX : 0), -1);
+        VM_structSetAndFreeVal(ctx, fr, "y", RValue_makeReal(tp ? tp->sourceY : 0), -1);
+        VM_structSetAndFreeVal(ctx, fr, "w", RValue_makeReal(tp ? tp->sourceWidth : 0), -1);
+        VM_structSetAndFreeVal(ctx, fr, "h", RValue_makeReal(tp ? tp->sourceHeight : 0), -1);
+        VM_structSetAndFreeVal(ctx, fr, "crop_width", RValue_makeReal(tp ? tp->targetWidth : 0), -1);
+        VM_structSetAndFreeVal(ctx, fr, "crop_height", RValue_makeReal(tp ? tp->targetHeight : 0), -1);
+        VM_structSetAndFreeVal(ctx, fr, "x_offset", RValue_makeReal(tp ? tp->targetX : 0), -1);
+        VM_structSetAndFreeVal(ctx, fr, "y_offset", RValue_makeReal(tp ? tp->targetY : 0), -1);
+        VM_structSetAndFreeVal(ctx, fr, "texture", RValue_makeInt32(tpagIndex), -1);
+        RValue frv = RValue_makeStructAndIncRef(fr);
+        GMLArray_set(frames, (int32_t) i, frv); // copies into the slot
+        RValue_free(&frv);
+    }
+    VM_structSetAndFreeVal(ctx, ret, "frames", RValue_makeArray(frames), -1);
+
     return RValue_makeStructAndIncRef(ret);
+}
+
+// ===[ VIDEO FUNCTIONS ]===
+// There is no video decoder here, and adding one is out of proportion to what these calls are used
+// for. What matters is that a game which opens a cutscene is still told the video started and then
+// finished: GameMaker delivers both as async events, and a game whose only way out of the cutscene
+// is "video_end" hangs forever without them. DELTARUNE Chapter 5's garden cutscene is exactly that.
+// So the video is reported as playing for one step and then ended, the picture is simply absent, and
+// any audio the game plays alongside it is untouched.
+
+static RValue builtin_video_open(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Runner* runner = ctx->runner;
+    char* path = (argCount > 0) ? RValue_toString(args[0]) : nullptr;
+    fprintf(stderr, "Video: WARNING: '%s' cannot be played (no video decoder); reporting it as finished so the game continues\n",
+            path != nullptr ? path : "<none>");
+    free(path);
+    runner->videoStatus = VIDEO_STATUS_PLAYING;
+    runner->videoStartPending = true;
+    runner->videoEndPending = false;
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_video_close(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Runner* runner = ctx->runner;
+    runner->videoStatus = VIDEO_STATUS_CLOSED;
+    runner->videoStartPending = false;
+    runner->videoEndPending = false;
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_video_get_status(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    return RValue_makeReal((GMLReal) ctx->runner->videoStatus);
+}
+
+static RValue builtin_video_pause(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Runner* runner = ctx->runner;
+    if (runner->videoStatus == VIDEO_STATUS_PLAYING) runner->videoStatus = VIDEO_STATUS_PAUSED;
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_video_resume(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Runner* runner = ctx->runner;
+    if (runner->videoStatus == VIDEO_STATUS_PAUSED) runner->videoStatus = VIDEO_STATUS_PLAYING;
+    return RValue_makeUndefined();
+}
+
+// video_draw() hands back an array whose first entry is a per-frame status; anything other than 0
+// means "no new frame", which is what keeps callers from trying to draw a surface we never made.
+static RValue builtin_video_draw(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    GMLArray* result = GMLArray_create(ctx->dataWin->gen8.wadVersion, 1);
+    *GMLArray_slot(result, 0) = RValue_makeReal(1.0);
+    return RValue_makeArray(result);
+}
+
+static RValue builtin_video_zero(MAYBE_UNUSED VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    return RValue_makeReal(0.0);
+}
+
+static RValue builtin_video_noop(MAYBE_UNUSED VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    return RValue_makeUndefined();
+}
+
+// ===[ PARTICLE FUNCTIONS ]===
+// Thin bindings over particles.c. Everything that can be asked of a dead id returns undefined rather
+// than faulting, matching GameMaker, where calling a part_* setter on a destroyed id is a silent no-op.
+
+static RValue builtin_part_system_create(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    return RValue_makeReal((GMLReal) Particles_systemCreate(ctx->runner));
+}
+
+static RValue builtin_part_system_destroy(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Particles_systemDestroy(ctx->runner, RValue_toInt32(args[0]));
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_system_depth(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Particles_systemSetDepth(ctx->runner, RValue_toInt32(args[0]), RValue_toInt32(args[1]));
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_system_automatic_draw(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Particles_systemSetAutomaticDraw(ctx->runner, RValue_toInt32(args[0]), RValue_toBool(args[1]));
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_system_update(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Particles_updateSystem(ctx->runner, RValue_toInt32(args[0]));
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_system_drawit(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Particles_drawSystem(ctx->runner, RValue_toInt32(args[0]));
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_system_automatic_update(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    ParticleSystem* system = Particles_systemGet(ctx->runner, RValue_toInt32(args[0]));
+    if (system == nullptr) return RValue_makeUndefined();
+    system->automaticUpdate = RValue_toBool(args[1]);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_system_position(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    ParticleSystem* system = Particles_systemGet(ctx->runner, RValue_toInt32(args[0]));
+    if (system == nullptr) return RValue_makeUndefined();
+    system->originX = RValue_toReal(args[1]);
+    system->originY = RValue_toReal(args[2]);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_system_clear(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Particles_systemClear(ctx->runner, RValue_toInt32(args[0]));
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_system_exists(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    return RValue_makeReal(Particles_systemGet(ctx->runner, RValue_toInt32(args[0])) != nullptr ? 1.0 : 0.0);
+}
+
+static RValue builtin_part_particles_create(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Particles_particlesCreate(ctx->runner, RValue_toInt32(args[0]), RValue_toReal(args[1]), RValue_toReal(args[2]),
+                              RValue_toInt32(args[3]), RValue_toInt32(args[4]), 0xFFFFFFu, false);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_particles_create_colour(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Particles_particlesCreate(ctx->runner, RValue_toInt32(args[0]), RValue_toReal(args[1]), RValue_toReal(args[2]),
+                              RValue_toInt32(args[3]), RValue_toInt32(args[5]), (uint32_t) RValue_toInt32(args[4]), true);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_particles_count(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    return RValue_makeReal((GMLReal) Particles_systemParticleCount(ctx->runner, RValue_toInt32(args[0])));
+}
+
+static RValue builtin_part_particles_clear(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Particles_systemClearParticles(ctx->runner, RValue_toInt32(args[0]));
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_type_create(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    return RValue_makeReal((GMLReal) Particles_typeCreate(ctx->runner));
+}
+
+static RValue builtin_part_type_clear(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Particles_typeClear(ctx->runner, RValue_toInt32(args[0]));
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_type_exists(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    return RValue_makeReal(Particles_typeGet(ctx->runner, RValue_toInt32(args[0])) != nullptr ? 1.0 : 0.0);
+}
+
+static RValue builtin_part_type_destroy(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Particles_typeDestroy(ctx->runner, RValue_toInt32(args[0]));
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_type_sprite(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    ParticleType* type = Particles_typeGet(ctx->runner, RValue_toInt32(args[0]));
+    if (type == nullptr) return RValue_makeUndefined();
+    type->sprite = RValue_toInt32(args[1]);
+    type->spriteAnimate = RValue_toBool(args[2]);
+    type->spriteStretch = RValue_toBool(args[3]);
+    type->spriteRandom = RValue_toBool(args[4]);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_type_size(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    ParticleType* type = Particles_typeGet(ctx->runner, RValue_toInt32(args[0]));
+    if (type == nullptr) return RValue_makeUndefined();
+    type->sizeMin = RValue_toReal(args[1]);
+    type->sizeMax = RValue_toReal(args[2]);
+    type->sizeIncr = RValue_toReal(args[3]);
+    type->sizeWiggle = RValue_toReal(args[4]);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_type_scale(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    ParticleType* type = Particles_typeGet(ctx->runner, RValue_toInt32(args[0]));
+    if (type == nullptr) return RValue_makeUndefined();
+    type->scaleX = RValue_toReal(args[1]);
+    type->scaleY = RValue_toReal(args[2]);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_type_speed(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    ParticleType* type = Particles_typeGet(ctx->runner, RValue_toInt32(args[0]));
+    if (type == nullptr) return RValue_makeUndefined();
+    type->speedMin = RValue_toReal(args[1]);
+    type->speedMax = RValue_toReal(args[2]);
+    type->speedIncr = RValue_toReal(args[3]);
+    type->speedWiggle = RValue_toReal(args[4]);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_type_direction(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    ParticleType* type = Particles_typeGet(ctx->runner, RValue_toInt32(args[0]));
+    if (type == nullptr) return RValue_makeUndefined();
+    // Stored unnormalised on purpose: games pass reversed ranges (DELTARUNE Chapter 4 uses -45 to -90)
+    // and expect GameMaker's "min + random * (max - min)", which sweeps downward.
+    type->dirMin = RValue_toReal(args[1]);
+    type->dirMax = RValue_toReal(args[2]);
+    type->dirIncr = RValue_toReal(args[3]);
+    type->dirWiggle = RValue_toReal(args[4]);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_type_gravity(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    ParticleType* type = Particles_typeGet(ctx->runner, RValue_toInt32(args[0]));
+    if (type == nullptr) return RValue_makeUndefined();
+    type->gravityAmount = RValue_toReal(args[1]);
+    type->gravityDirection = RValue_toReal(args[2]);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_type_life(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    ParticleType* type = Particles_typeGet(ctx->runner, RValue_toInt32(args[0]));
+    if (type == nullptr) return RValue_makeUndefined();
+    type->lifeMin = RValue_toInt32(args[1]);
+    type->lifeMax = RValue_toInt32(args[2]);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_type_orientation(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    ParticleType* type = Particles_typeGet(ctx->runner, RValue_toInt32(args[0]));
+    if (type == nullptr) return RValue_makeUndefined();
+    type->angMin = RValue_toReal(args[1]);
+    type->angMax = RValue_toReal(args[2]);
+    type->angIncr = RValue_toReal(args[3]);
+    type->angWiggle = RValue_toReal(args[4]);
+    type->angRelative = (argCount > 5) && RValue_toBool(args[5]);
+    return RValue_makeUndefined();
+}
+
+// alpha1 and alpha2 are the same curve as alpha3 with the stops collapsed.
+static RValue builtin_part_type_alpha1(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    ParticleType* type = Particles_typeGet(ctx->runner, RValue_toInt32(args[0]));
+    if (type == nullptr) return RValue_makeUndefined();
+    type->alphaStart = type->alphaMiddle = type->alphaEnd = RValue_toReal(args[1]);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_type_alpha2(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    ParticleType* type = Particles_typeGet(ctx->runner, RValue_toInt32(args[0]));
+    if (type == nullptr) return RValue_makeUndefined();
+    GMLReal start = RValue_toReal(args[1]);
+    GMLReal end = RValue_toReal(args[2]);
+    type->alphaStart = start;
+    type->alphaMiddle = (start + end) * 0.5;
+    type->alphaEnd = end;
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_type_alpha3(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    ParticleType* type = Particles_typeGet(ctx->runner, RValue_toInt32(args[0]));
+    if (type == nullptr) return RValue_makeUndefined();
+    type->alphaStart = RValue_toReal(args[1]);
+    type->alphaMiddle = RValue_toReal(args[2]);
+    type->alphaEnd = RValue_toReal(args[3]);
+    return RValue_makeUndefined();
+}
+
+// Ditto for the colour curve.
+static RValue builtin_part_type_colour1(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    ParticleType* type = Particles_typeGet(ctx->runner, RValue_toInt32(args[0]));
+    if (type == nullptr) return RValue_makeUndefined();
+    type->colourStart = type->colourMiddle = type->colourEnd = (uint32_t) RValue_toInt32(args[1]);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_type_colour2(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    ParticleType* type = Particles_typeGet(ctx->runner, RValue_toInt32(args[0]));
+    if (type == nullptr) return RValue_makeUndefined();
+    uint32_t start = (uint32_t) RValue_toInt32(args[1]);
+    uint32_t end = (uint32_t) RValue_toInt32(args[2]);
+    type->colourStart = start;
+    type->colourEnd = end;
+    // Halfway stop sits on the straight line between the two, so a two-stop curve stays linear.
+    type->colourMiddle = Particles_colourMidpoint(start, end);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_type_colour3(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    ParticleType* type = Particles_typeGet(ctx->runner, RValue_toInt32(args[0]));
+    if (type == nullptr) return RValue_makeUndefined();
+    type->colourStart = (uint32_t) RValue_toInt32(args[1]);
+    type->colourMiddle = (uint32_t) RValue_toInt32(args[2]);
+    type->colourEnd = (uint32_t) RValue_toInt32(args[3]);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_type_step(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    ParticleType* type = Particles_typeGet(ctx->runner, RValue_toInt32(args[0]));
+    if (type == nullptr) return RValue_makeUndefined();
+    type->stepNumber = RValue_toInt32(args[1]);
+    type->stepType = RValue_toInt32(args[2]);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_type_blend(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    ParticleType* type = Particles_typeGet(ctx->runner, RValue_toInt32(args[0]));
+    if (type == nullptr) return RValue_makeUndefined();
+    type->additive = RValue_toBool(args[1]);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_type_death(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    ParticleType* type = Particles_typeGet(ctx->runner, RValue_toInt32(args[0]));
+    if (type == nullptr) return RValue_makeUndefined();
+    type->deathNumber = RValue_toInt32(args[1]);
+    type->deathType = RValue_toInt32(args[2]);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_emitter_create(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    return RValue_makeReal((GMLReal) Particles_emitterCreate(ctx->runner, RValue_toInt32(args[0])));
+}
+
+static RValue builtin_part_emitter_destroy(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Particles_emitterDestroy(ctx->runner, RValue_toInt32(args[0]), RValue_toInt32(args[1]));
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_emitter_exists(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    return RValue_makeReal(Particles_emitterGet(ctx->runner, RValue_toInt32(args[0]), RValue_toInt32(args[1])) != nullptr ? 1.0 : 0.0);
+}
+
+static RValue builtin_part_emitter_destroy_all(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Particles_emitterDestroyAll(ctx->runner, RValue_toInt32(args[0]));
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_emitter_region(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    ParticleEmitter* emitter = Particles_emitterGet(ctx->runner, RValue_toInt32(args[0]), RValue_toInt32(args[1]));
+    if (emitter == nullptr) return RValue_makeUndefined();
+    emitter->xmin = RValue_toReal(args[2]);
+    emitter->xmax = RValue_toReal(args[3]);
+    emitter->ymin = RValue_toReal(args[4]);
+    emitter->ymax = RValue_toReal(args[5]);
+    emitter->shape = RValue_toInt32(args[6]);
+    emitter->distribution = RValue_toInt32(args[7]);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_emitter_stream(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    ParticleEmitter* emitter = Particles_emitterGet(ctx->runner, RValue_toInt32(args[0]), RValue_toInt32(args[1]));
+    if (emitter == nullptr) return RValue_makeUndefined();
+    emitter->streamType = RValue_toInt32(args[2]);
+    // Kept as a real: GameMaker spends the fractional part as a chance of one extra particle, which
+    // is how a game asks an emitter for fewer than one particle per step.
+    emitter->streamNumber = RValue_toReal(args[3]);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_part_emitter_burst(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Particles_emitterBurst(ctx->runner, RValue_toInt32(args[0]), RValue_toInt32(args[1]), RValue_toInt32(args[2]), RValue_toReal(args[3]));
+    return RValue_makeUndefined();
 }
 
 // ===[ REGISTRATION ]===
@@ -16557,6 +17748,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "file_text_writeln", builtin_file_text_writeln);
     VM_registerBuiltin(ctx, "file_text_write_real", builtin_file_text_write_real);
     VM_registerBuiltin(ctx, "file_text_eof", builtin_file_text_eof);
+    VM_registerBuiltin(ctx, "file_copy", builtin_file_copy);
     VM_registerBuiltin(ctx, "file_delete", builtin_file_delete);
     VM_registerBuiltin(ctx, "file_find_first", builtin_file_find_first);
     VM_registerBuiltin(ctx, "file_find_next", builtin_file_find_next);
@@ -16800,6 +17992,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
 
     // Motion
     VM_registerBuiltin(ctx, "motion_add", builtin_motion_add);
+    VM_registerBuiltin(ctx, "motion_set", builtin_motion_set);
 
     // Color
     VM_registerBuiltin(ctx, "merge_color", builtin_merge_color);
@@ -16918,6 +18111,120 @@ void VMBuiltins_registerAll(VMContext* ctx) {
         VM_registerBuiltin(ctx, "tile_set_visible", builtin_layer_tile_visible);
     }
 
+    // ===[ Unimplemented-engine stubs so game logic doesn't stall (Pizza Tower et al.) ]===
+    // FMOD audio -> mute; is_playing/paused=0 so cutscenes advance; create -> fake id.
+    VM_registerBuiltin(ctx, "fmod_init", builtin_pt_stub_void);
+    VM_registerBuiltin(ctx, "fmod_update", builtin_pt_stub_void);
+    VM_registerBuiltin(ctx, "fmod_bank_load", builtin_pt_stub_void);
+    VM_registerBuiltin(ctx, "fmod_set_parameter", builtin_pt_stub_void);
+    VM_registerBuiltin(ctx, "fmod_set_listener_attributes", builtin_pt_stub_void);
+    VM_registerBuiltin(ctx, "fmod_set_num_listeners", builtin_pt_stub_void);
+    VM_registerBuiltin(ctx, "fmod_event_create_instance", builtin_pt_stub_id);
+    VM_registerBuiltin(ctx, "fmod_event_instance_play", builtin_pt_stub_void);
+    VM_registerBuiltin(ctx, "fmod_event_instance_stop", builtin_pt_stub_void);
+    VM_registerBuiltin(ctx, "fmod_event_instance_set_paused", builtin_pt_stub_void);
+    VM_registerBuiltin(ctx, "fmod_event_instance_get_paused", builtin_pt_stub_zero);
+    VM_registerBuiltin(ctx, "fmod_event_instance_is_playing", builtin_pt_stub_zero);
+    VM_registerBuiltin(ctx, "fmod_event_instance_set_parameter", builtin_pt_stub_void);
+    VM_registerBuiltin(ctx, "fmod_event_instance_set_3d_attributes", builtin_pt_stub_void);
+    // Steam
+    VM_registerBuiltin(ctx, "steam_update", builtin_pt_stub_void);
+    VM_registerBuiltin(ctx, "steam_utils_is_steam_running_on_steam_deck", builtin_pt_stub_zero);
+    // Particles (visual only; create -> fake id, mutators no-op)
+    // Video (no decoder; see the section comment)
+    VM_registerBuiltin(ctx, "video_open", builtin_video_open);
+    VM_registerBuiltin(ctx, "video_close", builtin_video_close);
+    VM_registerBuiltin(ctx, "video_get_status", builtin_video_get_status);
+    VM_registerBuiltin(ctx, "video_pause", builtin_video_pause);
+    VM_registerBuiltin(ctx, "video_resume", builtin_video_resume);
+    VM_registerBuiltin(ctx, "video_draw", builtin_video_draw);
+    VM_registerBuiltin(ctx, "video_get_duration", builtin_video_zero);
+    VM_registerBuiltin(ctx, "video_get_position", builtin_video_zero);
+    VM_registerBuiltin(ctx, "video_get_format", builtin_video_zero);
+    VM_registerBuiltin(ctx, "video_get_volume", builtin_video_zero);
+    VM_registerBuiltin(ctx, "video_set_volume", builtin_video_noop);
+    VM_registerBuiltin(ctx, "video_set_position", builtin_video_noop);
+    VM_registerBuiltin(ctx, "video_enable_loop", builtin_video_noop);
+    VM_registerBuiltin(ctx, "video_is_looping", builtin_video_zero);
+
+    // Particles
+    VM_registerBuiltin(ctx, "part_system_create", builtin_part_system_create);
+    VM_registerBuiltin(ctx, "part_system_destroy", builtin_part_system_destroy);
+    VM_registerBuiltin(ctx, "part_system_depth", builtin_part_system_depth);
+    VM_registerBuiltin(ctx, "part_system_automatic_draw", builtin_part_system_automatic_draw);
+    VM_registerBuiltin(ctx, "part_system_automatic_update", builtin_part_system_automatic_update);
+    VM_registerBuiltin(ctx, "part_system_update", builtin_part_system_update);
+    VM_registerBuiltin(ctx, "part_system_drawit", builtin_part_system_drawit);
+    VM_registerBuiltin(ctx, "part_system_position", builtin_part_system_position);
+    VM_registerBuiltin(ctx, "part_system_clear", builtin_part_system_clear);
+    VM_registerBuiltin(ctx, "part_system_exists", builtin_part_system_exists);
+    VM_registerBuiltin(ctx, "part_particles_create", builtin_part_particles_create);
+    VM_registerBuiltin(ctx, "part_particles_create_colour", builtin_part_particles_create_colour);
+    VM_registerBuiltin(ctx, "part_particles_create_color", builtin_part_particles_create_colour);
+    VM_registerBuiltin(ctx, "part_particles_count", builtin_part_particles_count);
+    VM_registerBuiltin(ctx, "part_particles_clear", builtin_part_particles_clear);
+    VM_registerBuiltin(ctx, "part_type_create", builtin_part_type_create);
+    VM_registerBuiltin(ctx, "part_type_destroy", builtin_part_type_destroy);
+    VM_registerBuiltin(ctx, "part_type_clear", builtin_part_type_clear);
+    VM_registerBuiltin(ctx, "part_type_exists", builtin_part_type_exists);
+    VM_registerBuiltin(ctx, "part_type_sprite", builtin_part_type_sprite);
+    VM_registerBuiltin(ctx, "part_type_size", builtin_part_type_size);
+    VM_registerBuiltin(ctx, "part_type_scale", builtin_part_type_scale);
+    VM_registerBuiltin(ctx, "part_type_speed", builtin_part_type_speed);
+    VM_registerBuiltin(ctx, "part_type_direction", builtin_part_type_direction);
+    VM_registerBuiltin(ctx, "part_type_orientation", builtin_part_type_orientation);
+    VM_registerBuiltin(ctx, "part_type_gravity", builtin_part_type_gravity);
+    VM_registerBuiltin(ctx, "part_type_life", builtin_part_type_life);
+    VM_registerBuiltin(ctx, "part_type_alpha1", builtin_part_type_alpha1);
+    VM_registerBuiltin(ctx, "part_type_alpha2", builtin_part_type_alpha2);
+    VM_registerBuiltin(ctx, "part_type_alpha3", builtin_part_type_alpha3);
+    VM_registerBuiltin(ctx, "part_type_colour1", builtin_part_type_colour1);
+    VM_registerBuiltin(ctx, "part_type_color1", builtin_part_type_colour1);
+    VM_registerBuiltin(ctx, "part_type_colour2", builtin_part_type_colour2);
+    VM_registerBuiltin(ctx, "part_type_color2", builtin_part_type_colour2);
+    VM_registerBuiltin(ctx, "part_type_colour3", builtin_part_type_colour3);
+    VM_registerBuiltin(ctx, "part_type_color3", builtin_part_type_colour3);
+    VM_registerBuiltin(ctx, "part_type_blend", builtin_part_type_blend);
+    VM_registerBuiltin(ctx, "part_type_step", builtin_part_type_step);
+    VM_registerBuiltin(ctx, "part_type_death", builtin_part_type_death);
+    VM_registerBuiltin(ctx, "part_emitter_create", builtin_part_emitter_create);
+    VM_registerBuiltin(ctx, "part_emitter_destroy", builtin_part_emitter_destroy);
+    VM_registerBuiltin(ctx, "part_emitter_destroy_all", builtin_part_emitter_destroy_all);
+    VM_registerBuiltin(ctx, "part_emitter_exists", builtin_part_emitter_exists);
+    VM_registerBuiltin(ctx, "part_emitter_region", builtin_part_emitter_region);
+    VM_registerBuiltin(ctx, "part_emitter_stream", builtin_part_emitter_stream);
+    VM_registerBuiltin(ctx, "part_emitter_burst", builtin_part_emitter_burst);
+    // gameframe extension / windowing / input / misc — return neutral values
+    VM_registerBuiltin(ctx, "gameframe_check_native_extension", builtin_pt_stub_zero);
+    VM_registerBuiltin(ctx, "gameframe_init_raw_raw", builtin_pt_stub_void);
+    VM_registerBuiltin(ctx, "gameframe_set_shadow", builtin_pt_stub_void);
+    VM_registerBuiltin(ctx, "window_handle", builtin_pt_stub_zero);
+    VM_registerBuiltin(ctx, "window_get_x", builtin_pt_stub_zero);
+    VM_registerBuiltin(ctx, "window_get_y", builtin_pt_stub_zero);
+    VM_registerBuiltin(ctx, "window_mouse_get_x", builtin_pt_stub_zero);
+    VM_registerBuiltin(ctx, "window_mouse_get_y", builtin_pt_stub_zero);
+    VM_registerBuiltin(ctx, "display_get_dpi_x", builtin_pt_stub_zero);
+    VM_registerBuiltin(ctx, "switch_get_operation_mode", builtin_pt_stub_zero);
+    VM_registerBuiltin(ctx, "gpu_set_texfilter", builtin_pt_stub_void);
+    VM_registerBuiltin(ctx, "gpu_set_texfilter_ext", builtin_pt_stub_void);
+    VM_registerBuiltin(ctx, "font_add_enable_aa", builtin_pt_stub_void);
+    VM_registerBuiltin(ctx, "gamepad_set_vibration", builtin_pt_stub_void);
+    VM_registerBuiltin(ctx, "date_current_datetime", builtin_date_current_datetime);
+    VM_registerBuiltin(ctx, "date_get_year", builtin_date_get_year);
+    VM_registerBuiltin(ctx, "date_get_month", builtin_date_get_month);
+    VM_registerBuiltin(ctx, "date_get_day", builtin_date_get_day);
+    VM_registerBuiltin(ctx, "date_get_hour", builtin_date_get_hour);
+    VM_registerBuiltin(ctx, "date_get_minute", builtin_date_get_minute);
+    VM_registerBuiltin(ctx, "date_get_second", builtin_date_get_second);
+    VM_registerBuiltin(ctx, "buffer_get_address", builtin_pt_stub_zero);
+    VM_registerBuiltin(ctx, "int64", builtin_pt_stub_zero);
+    // Bisect switch (RunnerCFG builtins_new_off=1): the builtins that went from no-op/absent to
+    // actually doing something on 2026-08-02. They change real game logic -- arrays that were
+    // empty now fill, lists that never shuffled now shuffle -- so a regression in that batch has
+    // to be separable from the rest without another build.
+    VM_registerBuiltin(ctx, "array_copy", builtin_array_copy);
+    VM_registerBuiltin(ctx, "array_sort", builtin_array_sort);
+
     // Layer
     VM_registerBuiltin(ctx, "layer_force_draw_depth", builtin_layer_force_draw_depth);
     VM_registerBuiltin(ctx, "layer_is_draw_depth_forced", builtin_layer_is_draw_depth_forced);
@@ -16971,6 +18278,22 @@ void VMBuiltins_registerAll(VMContext* ctx) {
 	VM_registerBuiltin(ctx, "tilemap_get_tile_width", builtin_tilemap_get_tile_width);
     VM_registerBuiltin(ctx, "tilemap_get_tile_height", builtin_tilemap_get_tile_height);
     VM_registerBuiltin(ctx, "tilemap_get", builtin_tilemap_get);
+    VM_registerBuiltin(ctx, "tilemap_get_frame", builtin_tilemap_get_frame);
+    // draw_tile is NOT registered, deliberately. Its first argument is a tileset id in
+    // GameMaker's numbering, and this runner indexes tilesets as BGND entries: measured on
+    // console, the GRASS layer answers tilemap_get_tileset() = 137 while the game's own code
+    // passes the literal 17 for that same layer. Every literal a game hands draw_tile therefore
+    // names the wrong background here.
+    //
+    // Registering it woke twelve call sites at once -- obj_plat_floortex_FLOOR,
+    // obj_plat_vertical_floor_grass_strip, obj_waterreflect, obj_castlereflect and the
+    // scr_floortex_* group -- which had been silent no-ops, and they painted wrong tiles over
+    // the garden lamps. Until the two numberings are reconciled the honest answer is the one
+    // this runner gave before: the call does nothing, and its absence is visible in the
+    // "vm unk draw_tile" line rather than as garbage on screen.
+    //
+    // Runner_drawTileCell below is the drawing itself, and the obj_gardenlight fastpath calls
+    // it with a tileset it resolved through tilemap_get_tileset -- an index that IS ours.
     VM_registerBuiltin(ctx, "tilemap_get_at_pixel", builtin_tilemap_get_at_pixel);
     VM_registerBuiltin(ctx, "tilemap_get_tileset", builtin_tilemap_get_tileset);
     VM_registerBuiltin(ctx, "tile_get_index", builtin_tile_get_index);
@@ -16978,6 +18301,9 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "tile_get_flip", builtin_tile_get_flip);
     VM_registerBuiltin(ctx, "tile_get_rotate", builtin_tile_get_rotate);
     VM_registerBuiltin(ctx, "tile_set_empty", builtin_tile_set_empty);
+    VM_registerBuiltin(ctx, "tile_set_mirror", builtin_tile_set_mirror);
+    VM_registerBuiltin(ctx, "tile_set_flip", builtin_tile_set_flip);
+    VM_registerBuiltin(ctx, "tile_set_rotate", builtin_tile_set_rotate);
     VM_registerBuiltin(ctx, "tilemap_set", builtin_tilemap_set);
     VM_registerBuiltin(ctx, "tilemap_set_at_pixel", builtin_tilemap_set_at_pixel);
 #endif
@@ -17137,6 +18463,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "font_add_sprite", builtin_font_add_sprite);
     VM_registerBuiltin(ctx, "font_add_sprite_ext", builtin_font_add_sprite_ext);
     VM_registerBuiltin(ctx, "font_get_name", builtin_font_get_name);
+    VM_registerBuiltin(ctx, "font_get_size", builtin_font_get_size);
     VM_registerBuiltin(ctx, "font_get_info", builtin_font_get_info);
     VM_registerBuiltin(ctx, "object_exists", builtin_object_exists);
     VM_registerBuiltin(ctx, "object_get_name", builtin_object_get_name);
@@ -17188,6 +18515,10 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "shader_set", builtin_shader_set);
     VM_registerBuiltin(ctx, "shader_reset", builtin_shader_reset);
     VM_registerBuiltin(ctx, "shader_current", builtin_shader_current);
+    VM_registerBuiltin(ctx, "shader_replace_simple_sync", builtin_shader_replace_simple_stub);
+    VM_registerBuiltin(ctx, "shader_replace_simple", builtin_shader_replace_simple_stub);
+    VM_registerBuiltin(ctx, "shader_replace_simple_reset", builtin_shader_replace_simple_stub);
+    VM_registerBuiltin(ctx, "texturegroup_get_textures", builtin_texturegroup_get_textures);
     VM_registerBuiltin(ctx, "shader_is_compiled", builtin_shader_is_compiled);
     VM_registerBuiltin(ctx, "shader_get_name", builtin_shader_get_name);
     VM_registerBuiltin(ctx, "shaders_are_supported", builtin_shaders_are_supported);

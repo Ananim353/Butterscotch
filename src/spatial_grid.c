@@ -62,6 +62,16 @@ void SpatialGrid_syncGrid(Runner* runner, SpatialGrid* grid) {
 
         // We do not care about removed/inactive/destroyed instances, because they would've been already been removed from the grid on the "SpatialGrid_markInstanceAsDirty" call
         // We also do not care if the spatial grid is not dirty
+        // Clear the flag on the way out too, not just on the path that reindexes. The queue is
+        // emptied unconditionally below, so a skipped instance left with spatialGridDirty == true
+        // is out of the queue AND still marked dirty -- and markInstanceAsDirty early-returns on
+        // that flag. Deactivate an instance while it sits in this queue and it can never be
+        // re-added to any cell again: place_meeting stops seeing it for the rest of the session.
+        extern bool g_fixGridEnabled;
+        if (g_fixGridEnabled && instance != nullptr && instance->spatialGridDirty
+            && (!instance->active || instance->destroyed))
+            instance->spatialGridDirty = false;
+
         if (instance == nullptr || !instance->active || instance->destroyed || !instance->spatialGridDirty)
             continue;
 

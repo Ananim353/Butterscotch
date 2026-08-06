@@ -1,0 +1,29 @@
+# Line endings: LF everywhere, in the repository AND in the working tree.
+#
+# Without this the tree drifts to CRLF on Windows while upstream stores LF, and every file then
+# reads as fully rewritten: `git diff --stat` showed 206 files / +207463 / -204012, where
+# `-w --ignore-cr-at-eol` showed the truth -- 20 files / +3700 / -249. A commit taken in that
+# state is an unreadable blob and `git blame` is worthless afterwards.
+* text=auto eol=lf
+
+# Windows batch launchers are the one exception: cmd.exe needs CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary assets: never converted, never diffed as text.
+*.png  binary
+*.bmp  binary
+*.ico  binary
+*.ttf  binary
+*.otf  binary
+*.ogg  binary
+*.wav  binary
+*.at3  binary
+*.dat  binary
+*.win  binary
+*.psp  binary
+*.pbp  binary
+*.prx  binary
+*.elf  binary
+*.jar  binary
+*.rec  binary

@@ -20,6 +20,16 @@ typedef struct {
 } OverlayFileSystem;
 
 OverlayFileSystem* OverlayFileSystem_create(const char* bundlePath, const char* savePath);
+
+#ifdef PLATFORM_PSP
+// Queue background reads of the save slots + dr.ini into the bs_io RAM cache
+// (boot-time warm while the player is on the title screen), so the first
+// Continue / save-star open needs no stick reads.
+// `legacyFallback` = also look in bundlePath for a save the saves/ migration has not
+// moved yet. Pass FALSE once the card is known to be fully migrated: an old copy left
+// in the game root would otherwise RESURRECT a slot the player erased.
+void OverlayFileSystem_warmSaveCache(OverlayFileSystem* ofs, bool legacyFallback);
+#endif
 void OverlayFileSystem_destroy(OverlayFileSystem* fs);
 
 #endif /* _BS_OVERLAY_FILE_SYSTEM_H_ */

@@ -10,8 +10,27 @@
 
 typedef float GMLReal;
 
+// Trig call counter, built only with BS_TRIG_COUNT. Every trig user funnels through these
+// macros — GML's sin/cos, lengthdir_x/y, point_direction, darctan2, and the rotated-box paths
+// in collision.h — so one increment here counts everything, and the total lands in PERF as
+// "trig=" per window.
+//
+// Measured 2026-07-30 on console: 2-3 calls per frame outdoors (240 per 2s window in
+// room_town_north, mostly draw_shadowcast's lengthdir_x), ZERO indoors, peak ~13. That is why
+// the VFPU's hardware vsin/vcos is NOT wired in: it would save thousandths of a millisecond,
+// despite 1140 textual uses of sin() in the chapter's GML. Kept so the same question can be
+// re-answered in a scene we have not profiled yet (battles, particle-heavy cutscenes) without
+// rebuilding the instrumentation from scratch.
+#if defined(__PSP__) && defined(BS_TRIG_COUNT)
+extern unsigned int g_trigCalls;
+static inline float bsTrigSin(float x) { g_trigCalls++; return sinf(x); }
+static inline float bsTrigCos(float x) { g_trigCalls++; return cosf(x); }
+#define GMLReal_sin bsTrigSin
+#define GMLReal_cos bsTrigCos
+#else
 #define GMLReal_sin sinf
 #define GMLReal_cos cosf
+#endif
 #define GMLReal_tan tanf
 #define GMLReal_acos acosf
 #define GMLReal_asin asinf

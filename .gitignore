@@ -5,3 +5,10 @@ CMakeUserPresets.json
 .devcontainer/
 compat/config.mk
 /.vs
+
+# Port build output and packed assets. dist/ alone is ~2 GB of texture packs and EBOOTs, every
+# byte of it regenerable from data.win by scripts/ -- it must never enter a commit.
+dist/
+artifacts/
+build-out-EBOOT.PBP
+*.tmp

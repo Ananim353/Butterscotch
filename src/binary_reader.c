@@ -28,7 +28,11 @@ void BinaryReader_clearBuffer(BinaryReader* reader) {
 
 static void readCheck(BinaryReader* reader, void* dest, size_t bytes) {
     if (reader->buffer != nullptr) {
-        if (reader->bufferPos + bytes > reader->bufferSize) {
+        // Subtraction form, not addition. size_t is 32-bit on PSP, so a corrupt length field turns
+        // "pos + bytes" into a small number and the guard waves it through -- exactly the case this
+        // guard exists for, since the input is a data.win read off a memory stick. bufferPos is
+        // kept <= bufferSize by every writer (see BinaryReader_skip), so the subtraction is safe.
+        if (reader->bufferPos > reader->bufferSize || bytes > reader->bufferSize - reader->bufferPos) {
             size_t absPos = reader->bufferBase + reader->bufferPos;
             fprintf(stderr, "BinaryReader: buffer read error at position 0x%zX (requested %zu bytes, buffer has %zu remaining)\n", absPos, bytes, reader->bufferSize - reader->bufferPos);
             abort();
@@ -106,19 +110,23 @@ void BinaryReader_readBytes(BinaryReader* reader, void* dest, size_t count) {
 }
 
 uint8_t* BinaryReader_readBytesAt(BinaryReader* reader, size_t offset, size_t count) {
-    uint8_t* buf = (uint8_t *)safeMalloc(count);
-
+    // Validate BEFORE allocating: a corrupt count would otherwise ask the allocator for gigabytes
+    // on its way to being rejected.
     if (reader->buffer != nullptr) {
-        if (offset < reader->bufferBase || offset + count > reader->bufferBase + reader->bufferSize) {
+        size_t rel = offset - reader->bufferBase;   // meaningful only once offset >= bufferBase
+        if (offset < reader->bufferBase || rel > reader->bufferSize
+            || count > reader->bufferSize - rel) {  // subtraction form: see readCheck
             fprintf(stderr, "BinaryReader: readBytesAt offset 0x%zX+%zu out of buffer range [0x%zX, 0x%zX)\n", offset, count, reader->bufferBase, reader->bufferBase + reader->bufferSize);
             abort();
         }
+        uint8_t* buf = (uint8_t*) safeMalloc(count);
         size_t savedPos = reader->bufferPos;
-        memcpy(buf, reader->buffer + (offset - reader->bufferBase), count);
+        memcpy(buf, reader->buffer + rel, count);
         reader->bufferPos = savedPos;
         return buf;
     }
 
+    uint8_t* buf = (uint8_t*) safeMalloc(count);
     long savedPos = ftell(reader->file);
     fseek(reader->file, (long) offset, SEEK_SET);
     readCheck(reader, buf, count);
@@ -128,6 +136,14 @@ uint8_t* BinaryReader_readBytesAt(BinaryReader* reader, size_t offset, size_t co
 
 void BinaryReader_skip(BinaryReader* reader, size_t bytes) {
     if (reader->buffer != nullptr) {
+        // Bounds-checked like every other move: without this a corrupt length skips past the end,
+        // and readCheck's "bufferSize - bufferPos" would then underflow into a huge remaining
+        // count -- the guard would pass and the read would run off the buffer.
+        if (reader->bufferPos > reader->bufferSize || bytes > reader->bufferSize - reader->bufferPos) {
+            fprintf(stderr, "BinaryReader: skip %zu past end at 0x%zX (size %zu)\n",
+                    bytes, reader->bufferBase + reader->bufferPos, reader->bufferSize);
+            abort();
+        }
         reader->bufferPos += bytes;
         return;
     }

@@ -45,6 +45,18 @@ typedef struct {
     // If true, precise masks will be skipped when the sprite does not have a precise state set
     bool skipLoadingPreciseMasksForNonPreciseSprites;
 
+    // When > 0 and the AUDO chunk is larger than this many bytes, embedded audio
+    // blobs are NOT loaded into RAM at parse time: entries keep dataOffset/dataSize
+    // and data == NULL, and the platform audio backend reads blobs on demand via
+    // lazyLoadFile. Chapter 5's AUDO is 119MB — resident blobs are impossible there,
+    // while chapter 1's 6MB stays resident (threshold keeps the proven path).
+    uint32_t audoLazyOverBytes;
+
+    // If true, TXTR blob data (compressed page images) is not loaded into RAM.
+    // Only safe when a full offline texture pack (textures.psp) serves every
+    // region — the runtime page-decode fallback returns false without blobs.
+    bool txtrSkipBlobs;
+
     // If true, Room payloads (backgrounds, views, gameObjects, tiles, layers) are parsed on demand via DataWin_loadRoomPayload during gameplay.
     bool lazyLoadRooms;
 
@@ -396,7 +408,7 @@ typedef struct {
     bool present;
     const char* name;
     const char* displayName;
-    uint32_t emSize;
+    float emSize;
     bool bold;
     bool italic;
     uint16_t rangeStart;
@@ -696,6 +708,12 @@ typedef struct {
     uint32_t gameObjectsFileOffset;
     uint32_t tilesFileOffset;
     uint32_t layersFileOffset; // 0 if pre-GMS2
+    // The room record's own span in the file: [recordStart, recordEnd). All payload
+    // sub-data lives inside it, so the lazy load can fetch it with ONE big read
+    // instead of hundreds of tiny ones (each stick command costs ~15-30ms flat).
+    // recordEnd == 0 => unknown (last record in the chunk) -> stream fallback.
+    uint32_t recordStartFileOffset;
+    uint32_t recordEndFileOffset;
     bool payloadLoaded;
     bool eagerlyLoaded; // set if this room's name matched DataWinParserOptions.eagerlyLoadedRooms; payload is preserved across transitions
 

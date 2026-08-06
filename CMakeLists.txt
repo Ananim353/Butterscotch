@@ -45,6 +45,9 @@ if(AUDIO_BACKEND STREQUAL "")
         set(AUDIO_BACKEND "openal")
     elseif(PLATFORM STREQUAL "ps2")
         set(AUDIO_BACKEND "ps2")
+    elseif(PLATFORM STREQUAL "psp")
+        # Phase 2: no audio yet (noop). A dedicated sceAudio backend lands in phase 5.
+        set(AUDIO_BACKEND "none")
     else()
         set(AUDIO_BACKEND "miniaudio")
     endif()
@@ -684,6 +687,97 @@ elseif(PLATFORM STREQUAL "ps3")
     # mojoal calls SDL atomics/threads, so SDL2 must link after it (static link order)
     target_link_libraries(mojoal PUBLIC ${SDL2_LIBRARIES})
     target_link_libraries(butterscotch PRIVATE ${SDL2_LIBRARIES} m gcm_sys rsx sysutil io audio rt lv2 io audio bzip2 stb_ds sha1 ps3gl mojoal stb_vorbis)
+elseif(PLATFORM STREQUAL "psp")
+    file(GLOB DEBUG_FONT_SOURCES src/debug_font/*.c)
+    target_sources(butterscotch PRIVATE ${DEBUG_FONT_SOURCES})
+    target_include_directories(butterscotch PRIVATE ${CMAKE_SOURCE_DIR}/src/debug_font)
+
+    # Runtime TXTR decode (QOI / BZ2+QOI / PNG) for the sceGu texture cache
+    file(GLOB IMAGE_SOURCES src/image/*.c)
+    target_sources(butterscotch PRIVATE ${IMAGE_SOURCES})
+    target_include_directories(butterscotch PRIVATE ${CMAKE_SOURCE_DIR}/src/image)
+
+    # OGG decode for the sceAudio backend (stb_vorbis implementation)
+    target_sources(butterscotch PRIVATE ${CMAKE_SOURCE_DIR}/vendor/stb/vorbis/stb_vorbis.c)
+    set_source_files_properties(${CMAKE_SOURCE_DIR}/vendor/stb/vorbis/stb_vorbis.c PROPERTIES COMPILE_FLAGS "-w")
+
+    # The PSP Allegrex FPU is single-precision only, so double is software-emulated.
+    add_compile_definitions(USE_FLOAT_REALS)
+    # ...which is exactly why stb_vorbis's table setup (compute_twiddle_factors /
+    # compute_window) costs ~110ms per open here: ~5184 software-emulated double sin/cos.
+    # This flips them to hardware-FPU cosf/sinf (the results are cast to float regardless),
+    # PSP-only so the desktop backends keep the original double path bit-for-bit.
+    add_compile_definitions(STBV_FAST_SETUP_TRIG)
+    # A particle is ~48 bytes with float GMLReal, so the 8192 default would reserve 393KB per
+    # system on a machine already rationing tile memory. DELTARUNE's heaviest system peaks at
+    # 89 live particles, so 1024 is still an order of magnitude of headroom for 48KB.
+    add_compile_definitions(PARTICLE_SYSTEM_MAX_PARTICLES=1024)
+    # Counts sin/cos per PERF window (see real_type.h). Measured at 2-3 calls/frame in the
+    # overworld, so the VFPU is not worth wiring in there — kept enabled to answer the same
+    # question for scenes not yet profiled. Costs one increment per call.
+    add_compile_definitions(BS_TRIG_COUNT)
+    # Disabling Int64 support fits the entire RValue struct in 8 bytes, saving memory
+    # and cycles on the memory-constrained PSP (same tradeoff as the PS2 target).
+    add_compile_definitions(NO_RVALUE_INT64)
+    # Platform identifier for PSP-specific code paths
+    add_compile_definitions(PLATFORM_PSP)
+
+    # Trim optional VM diagnostics to save code size / cycles on the handheld
+    option(ENABLE_VM_GML_PROFILER "Enable Butterscotch VM/interpreter profiler" OFF)
+    if(ENABLE_VM_GML_PROFILER)
+        add_compile_definitions(ENABLE_VM_GML_PROFILER)
+    endif()
+    option(ENABLE_VM_TRACING "Enable Butterscotch VM/interpreter tracing checks" OFF)
+    if(ENABLE_VM_TRACING)
+        add_compile_definitions(ENABLE_VM_TRACING)
+    endif()
+    option(ENABLE_VM_OPCODE_PROFILER "Enable Butterscotch VM opcode count profiler" OFF)
+    if(ENABLE_VM_OPCODE_PROFILER)
+        add_compile_definitions(ENABLE_VM_OPCODE_PROFILER)
+    endif()
+    option(ENABLE_VM_STUB_LOGS "Enable VM unknown/stubbed function logs" OFF)
+    if(ENABLE_VM_STUB_LOGS)
+        add_compile_definitions(ENABLE_VM_STUB_LOGS)
+    endif()
+    # VMPROF (ops/builtin-timing/varlk) — was always-on under PLATFORM_PSP and cost a
+    # per-instruction 64-bit RMW plus a syscall pair every 16th builtin call, on the
+    # hottest loops. OFF by default so shipping builds pay nothing; -DENABLE_VMPROF=ON
+    # for a VM-profiling session (adds the VMPROF/VMPROFTOP trace lines back).
+    option(ENABLE_VMPROF "Enable Butterscotch VM ops/builtin/varlk profiler (PSP)" OFF)
+    if(ENABLE_VMPROF)
+        add_compile_definitions(ENABLE_VMPROF)
+    endif()
+
+    # Treat unsuffixed float constants as single-precision to avoid float->double
+    # promotions on a target with no hardware double. Frees a register with
+    # -fomit-frame-pointer; -ffast-math enables aggressive FP optimizations.
+    target_compile_options(butterscotch PRIVATE -fsingle-precision-constant -fomit-frame-pointer -ffast-math -Wno-format)
+
+    # stb_image (texture decode) + stb_vorbis (OGG) for the later render/audio phases
+    target_include_directories(butterscotch PUBLIC vendor/stb/image)
+    target_include_directories(butterscotch PUBLIC vendor/stb/vorbis)
+
+    # PSPSDK libraries. Dependents listed before dependencies for left-to-right
+    # static resolution (pspgum->pspgu, pspaudiolib->pspaudio).
+    target_link_libraries(butterscotch PRIVATE
+        pspgum pspgu
+        pspaudiolib pspaudio
+        pspatrac3 psputility
+        psprtc # date_current_datetime: DELTARUNE stamps every save with the wall clock
+        pspdebug pspdisplay pspge pspctrl psppower
+        m stb_ds sha1 bzip2 stb_vorbis)
+
+    # Package the ELF into a bootable EBOOT.PBP (macro provided by pspdev.cmake).
+    # ICON_PATH = XMB list icon (144x80), BACKGROUND_PATH = cover art shown behind the
+    # game info (480x272). Assets live in psp-assets/ so they travel with the repo.
+    create_pbp_file(
+        TARGET butterscotch
+        TITLE "DELTARUNE"
+        ICON_PATH ${CMAKE_SOURCE_DIR}/psp-assets/ICON0.PNG
+        BACKGROUND_PATH ${CMAKE_SOURCE_DIR}/psp-assets/PIC1.PNG
+        MUSIC_PATH ${CMAKE_SOURCE_DIR}/psp-assets/SND0.AT3
+        OUTPUT_DIR ${CMAKE_BINARY_DIR}
+    )
 else()
     message(FATAL_ERROR "Unknown platform! ${PLATFORM}")
 endif()

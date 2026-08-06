@@ -8,6 +8,7 @@
 #include "file_system.h"
 #include "ini.h"
 #include "instance.h"
+#include "particles.h"
 #include "renderer.h"
 #include "runner_keyboard.h"
 #include "spatial_grid.h"
@@ -91,6 +92,12 @@
 #define OTHER_ASYNC_DIALOG   63
 #define OTHER_ASYNC_SAVE_LOAD 72
 #define OTHER_ASYNC_SYSTEM   75
+#define OTHER_ASYNC_VIDEO    70
+
+// video_get_status() values, as GML reads them.
+#define VIDEO_STATUS_CLOSED  0
+#define VIDEO_STATUS_PLAYING 2
+#define VIDEO_STATUS_PAUSED  3
 
 #define MAX_VIEWS 8
 #define MAX_SURFACES 16
@@ -257,7 +264,7 @@ typedef struct {
 
 // A single entry in the depth-sorted draw list. Cached on Runner and rebuilt lazily based on Runner.drawableListStructureDirty / drawableListSortDirty.
 // Filtering on instance->active/visible and runtimeLayer->visible happens at draw time so toggling those does not require invalidating the cache.
-typedef enum { DRAWABLE_TILE, DRAWABLE_INSTANCE, DRAWABLE_LAYER } DrawableType;
+typedef enum { DRAWABLE_TILE, DRAWABLE_INSTANCE, DRAWABLE_LAYER, DRAWABLE_PARTICLE_SYSTEM } DrawableType;
 
 typedef struct {
     DrawableType type;
@@ -267,6 +274,8 @@ typedef struct {
         int32_t tileIndex;
         // Stored as an ID (resolved via Runner_findRuntimeLayerById) instead of a pointer, because layer_create can call arrput on runner->runtimeLayers mid-draw and realloc the array, invalidating any cached pointers.
         int32_t runtimeLayerId;
+        // Same reasoning as runtimeLayerId: part_system_create during a draw event can realloc the pool.
+        int32_t particleSystemId;
     };
 } Drawable;
 
@@ -387,6 +396,8 @@ typedef struct {
     char* filePath; // relative path (for write mode, to flush on close)
     int32_t readPos; // current byte position in content (read mode)
     int32_t contentLen; // length of content string
+    int32_t writeLen; // bytes used in writeBuffer (write mode) — avoids O(n) strlen per append
+    int32_t writeCap; // allocated capacity of writeBuffer (write mode)
     bool isWriteMode;
     bool isOpen;
 } OpenTextFile;
@@ -546,6 +557,10 @@ struct Runner {
     DsGrid* dsGridPool; // stb_ds array of DsGrid
     GmlBuffer* gmlBufferPool; // stb_ds array of GmlBuffer
     MpGrid* mpGridPool; // stb_ds array of motion-planning grids
+    // Particle systems own their emitters and live particles; types are global and can be streamed by
+    // any system's emitters. Both pools reuse destroyed slots, matching the ds_* id behaviour.
+    ParticleSystem* particleSystemPool; // stb_ds array of ParticleSystem
+    ParticleType* particleTypePool; // stb_ds array of ParticleType
 
     // Motion planning potential field settings
     GMLReal mpPotMaxrot;
@@ -560,11 +575,21 @@ struct Runner {
     IniFile* currentIni;
     char* currentIniPath;
     bool currentIniDirty;
+    // The file is there but reading it failed, so currentIni is an EMPTY stand-in rather than
+    // the file's contents. Writing that back would erase every key the file actually holds --
+    // which is how a DELTARUNE save came back with nothing but its timestamp. ini_close refuses
+    // to write, and refuses to cache, while this is set.
+    bool currentIniReadFailed;
     // Some games (like Undertale) open and close the same INI file EVERY SINGLE FRAME!
     // While on modern devices this isn't a huge deal, this WILL cause issues on devices that have less than stellar file systems (like the PlayStation 2)
-    // To avoid unnecessary disk reads, we cache the last-closed INI and reuse it on reopen
-    IniFile* cachedIni; // Cache of last-closed INI (for fast reopen)
-    char* cachedIniPath;
+    // To avoid unnecessary disk reads, we cache closed INIs and reuse them on reopen.
+    // Multiple slots: DELTARUNE's save closes dr.ini then keyconfig_N.ini, so a single
+    // slot was evicted on every save and dr.ini (~1k keys) re-parsed each time (~32ms).
+#define INI_CACHE_SLOTS 4
+    IniFile* cachedIni[INI_CACHE_SLOTS]; // caches of last-closed INIs (fast reopen)
+    char* cachedIniPath[INI_CACHE_SLOTS];
+    uint32_t cachedIniAge[INI_CACHE_SLOTS]; // for oldest-slot eviction
+    uint32_t cachedIniTick;
 
     // Text file handles for file_text_* functions
     OpenTextFile openTextFiles[MAX_OPEN_TEXT_FILES];
@@ -576,6 +601,14 @@ struct Runner {
 
     // Async map ID
     int32_t asyncLoadMapId;
+
+    // Video playback state. Nothing is decoded — there is no video decoder here — but a game that
+    // opens a cutscene still has to be told the video started and then finished, or it waits on an
+    // async event that never arrives and the run stops dead. DELTARUNE Chapter 5's garden cutscene
+    // is exactly that: its only exit is the "video_end" async event.
+    int32_t videoStatus;      // VIDEO_STATUS_*; what video_get_status() reports
+    bool videoStartPending;   // an open is waiting to post its "video_start"
+    bool videoEndPending;     // "video_start" has been posted; "video_end" goes out next step
 
     // Async buffer save/load state
     char* asyncBufferGroupName;                   // current group name (nullptr when no group is open); applied as a directory prefix
@@ -631,8 +664,24 @@ void Runner_reset(Runner* runner);
 Runner* Runner_create(DataWin* dataWin, VMContext* vm, Renderer* renderer, FileSystem* fileSystem, AudioSystem* audioSystem);
 void Runner_setGameArgs(Runner* runner, char** argv, int32_t argc);
 void Runner_initFirstRoom(Runner* runner);
+// Frame-compare harness: jump to `roomIndex` once the game has booted (-1 = off).
+// Not a boot override — ROOM_INITIALIZE must run first or the room's globals are undefined.
+void Runner_setStartRoom(int32_t roomIndex);
 void Runner_step(Runner* runner);
 void Runner_handlePendingRoomChange(Runner* runner);
+
+// True when every enabled follow-camera sits where its follow logic (at unlimited
+// speed) would put it, and its target instance exists. The PSP present gate hides
+// post-room-change frames until this settles (late target positioning otherwise
+// flashes the wrong part of the room for a frame).
+bool Runner_viewsSettled(Runner* runner);
+
+// True when NO enabled view follows an object (camera->objectId < 0 everywhere,
+// or views are off): the camera comes from room data / creation code and is
+// already correct on the room's first frame. The PSP present gate skips its
+// post-room-change curtain entirely for such rooms — an instant-cut sequence
+// (the gameover heartbreak) shows its first frames instead of black.
+bool Runner_viewsStatic(Runner* runner);
 void Runner_executeEvent(Runner* runner, Instance* instance, int32_t eventType, int32_t eventSubtype);
 void Runner_executeEventFromObject(Runner* runner, Instance* instance, int32_t startObjectIndex, int32_t eventType, int32_t eventSubtype);
 void Runner_executeEventForAll(Runner* runner, int32_t eventType, int32_t eventSubtype);
@@ -660,6 +709,21 @@ GMLCamera* Runner_getCameraById(Runner* runner, int32_t id);
 GMLCamera* Runner_getCameraForView(Runner* runner, int32_t viewIndex);
 void Runner_scrollBackgrounds(Runner* runner);
 void Runner_drawTileLayer(Runner* runner, RoomLayerTilesData* data, float layerOffsetX, float layerOffsetY);
+// Tile size of a tileset, 0 when the index names none. A caller that knows the geometry its
+// arithmetic assumes can use this to notice it resolved the wrong layer.
+uint32_t Runner_tilesetTileWidth(Runner* runner, int32_t backgroundIndex);
+// One tileset cell with the caller's colour and alpha. backgroundIndex is a BGND index of THIS
+// runner (see the note at the definition: it is not the tileset id the game's own code uses).
+void Runner_drawTileCell(Runner* runner, int32_t backgroundIndex, uint32_t cell,
+                         float x, float y, uint32_t color, float alpha);
+
+// GMS2 tilemap cell bit layout (matches HTML5 Function_Layers.js TileIndex/Mirror/Flip/Rotate
+// masks). Shared because a cell is decoded in two places: Runner_drawTileLayer draws a whole
+// layer, and draw_tile() in vm_builtins.c draws one cell at a time.
+#define GMS2_TILE_INDEX_MASK  0x0007FFFF // bits 0..18
+#define GMS2_TILE_MIRROR_MASK 0x10000000 // bit 28 (horizontal flip)
+#define GMS2_TILE_FLIP_MASK   0x20000000 // bit 29 (vertical flip)
+#define GMS2_TILE_ROTATE_MASK 0x40000000 // bit 30 (90 CW)
 // Allocates a fresh GML struct and registers it in instancesById and structInstances.
 // refCount starts at 1 (the registry's implicit ref); callers that retain a reference must Instance_structIncRef.
 Instance* Runner_createStruct(Runner* runner);

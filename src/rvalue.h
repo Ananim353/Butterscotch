@@ -280,41 +280,117 @@ static inline RValue RValue_stealOwnershipOrCopy(RValue val) {
     return RValue_makeIndependent(val);
 }
 
-// Converts an RValue to a heap-allocated string representation.
-// The caller must free the returned string
-static inline char* RValue_toString(RValue val) {
-    char buf[64];
+// Integer -> decimal without snprintf: newlib's %lld drags in the soft-float printf
+// machinery (~10-20us per call on the PSP's MIPS), and integer formatting is the hot
+// case — save files write tens of thousands of integers, battle text draws numbers
+// every frame. Handles INT64_MIN. Returns the length; buf needs >= 21 bytes.
+static inline int RValue_formatInt64(int64_t v, char* buf) {
+    char tmp[20];
+    int n = 0;
+    uint64_t u = (v < 0) ? ((uint64_t) (-(v + 1))) + 1u : (uint64_t) v;
+    // MIPS32 has no hardware 64-bit divide — each u64 %/÷ pair is two libgcc soft
+    // calls, which made the first version of this "fast" formatter as slow as
+    // snprintf (measured 12us/call in save writes). Drop to 32-bit hardware DIVU as
+    // soon as the value fits, which is virtually always for game values.
+    while (u > 0xFFFFFFFFu) {
+        tmp[n++] = (char) ('0' + (uint32_t) (u % 10u));
+        u /= 10u;
+    }
+    uint32_t u32 = (uint32_t) u;
+    do { tmp[n++] = (char) ('0' + (u32 % 10u)); u32 /= 10u; } while (u32 != 0);
+    int len = 0;
+    if (v < 0) buf[len++] = '-';
+    while (n > 0) buf[len++] = tmp[--n];
+    buf[len] = '\0';
+    return len;
+}
+
+// Formats a NUMERIC RValue (REAL/INT32/INT64/BOOL) into the caller's buffer (>= 64
+// bytes) without allocating. Returns the length, or -1 for non-numeric types (the
+// caller falls back to RValue_toString). Exactly mirrors RValue_toString's format.
+static inline int RValue_formatNumberToBuf(RValue val, char* buf) {
     switch (val.type) {
         case RVALUE_REAL: {
             GMLReal r = val.real;
-            if (isnan(r)) return safeStrdup("NaN");
-            if (isinf(r)) return safeStrdup(r < (GMLReal) 0 ? "-inf" : "inf");
+            if (isnan(r)) { memcpy(buf, "NaN", 4); return 3; }
+            if (isinf(r)) {
+                if (r < (GMLReal) 0) { memcpy(buf, "-inf", 5); return 4; }
+                memcpy(buf, "inf", 4); return 3;
+            }
+            // int32-range fast path first: float<->int64 round-trips are libgcc soft
+            // calls on MIPS, while float<->int32 is a hardware instruction. In-range,
+            // non-NaN casts cannot trap. Semantics match the int64 path exactly.
+            if (r >= (GMLReal) -2147483648.0 && r < (GMLReal) 2147483648.0) {
+                int32_t i32 = (int32_t) r;
+                if ((GMLReal) i32 == r)
+                    return RValue_formatInt64((int64_t) i32, buf);
+                return snprintf(buf, 64, "%.2f", (double) r);
+            }
 #ifdef USE_FLOAT_REALS
             const GMLReal INT_SAFE_BOUND = 9.2233715e18f; // largest float strictly < 2^63
 #else
             const GMLReal INT_SAFE_BOUND = 9.2233720368547758e18;
 #endif
-            // Is this a integer?
-            if (r >= -INT_SAFE_BOUND && r <= INT_SAFE_BOUND && r == (GMLReal) (int64_t) r) {
-                snprintf(buf, sizeof(buf), "%lld", (long long) (int64_t) r);
-            } else {
-                // For anything else, we format to two decimal places
-                snprintf(buf, sizeof(buf), "%.2f", (double) r);
-            }
-            return safeStrdup(buf);
+            if (r >= -INT_SAFE_BOUND && r <= INT_SAFE_BOUND && r == (GMLReal) (int64_t) r)
+                return RValue_formatInt64((int64_t) r, buf);
+            return snprintf(buf, 64, "%.2f", (double) r); // fractional: rare, keep snprintf
         }
         case RVALUE_INT32:
-            snprintf(buf, sizeof(buf), "%d", val.int32);
-            return safeStrdup(buf);
+            return RValue_formatInt64((int64_t) val.int32, buf);
 #ifndef NO_RVALUE_INT64
         case RVALUE_INT64:
-            snprintf(buf, sizeof(buf), "%lld", (long long) val.int64);
-            return safeStrdup(buf);
+            return RValue_formatInt64(val.int64, buf);
 #endif
+        case RVALUE_BOOL:
+            buf[0] = val.int32 ? '1' : '0'; buf[1] = '\0';
+            return 1;
+        default:
+            return -1;
+    }
+}
+
+// Hand parser for plain decimal literals: newlib's strtod costs ~12-15us on the PSP
+// (soft-double), and save loading / layer-name parsing calls it tens of thousands of
+// times. Mirrors strtod's prefix semantics (leading whitespace skipped, parse stops at
+// the first non-numeric char). Bails out with ok=false — caller MUST fall back to
+// strtod — on: no digits, 8+ digits in either part (double-rounding risk), exponents,
+// hex, inf/nan.
+static inline GMLReal GMLReal_parseDecimalFast(const char* s, const char** end, bool* ok) {
+    const char* p = s;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == '\v' || *p == '\f') p++;
+    bool neg = false;
+    if (*p == '-') { neg = true; p++; } else if (*p == '+') { p++; }
+    if (*p < '0' || *p > '9') { *ok = false; return (GMLReal) 0; }
+    int32_t ip = 0, idig = 0;
+    while (*p >= '0' && *p <= '9' && idig < 8) { ip = ip * 10 + (*p - '0'); p++; idig++; }
+    if (idig >= 8) { *ok = false; return (GMLReal) 0; }
+    GMLReal r = (GMLReal) ip;
+    if (*p == '.') {
+        p++;
+        int32_t fp = 0, fdig = 0, scale = 1;
+        while (*p >= '0' && *p <= '9' && fdig < 8) { fp = fp * 10 + (*p - '0'); scale *= 10; p++; fdig++; }
+        if (fdig >= 8) { *ok = false; return (GMLReal) 0; }
+        r += (GMLReal) fp / (GMLReal) scale;
+    }
+    if (*p == 'e' || *p == 'E') { *ok = false; return (GMLReal) 0; }               // exponent: strtod's job
+    if ((*p == 'x' || *p == 'X') && ip == 0 && idig == 1) { *ok = false; return (GMLReal) 0; } // hex
+    *end = p;
+    *ok = true;
+    return neg ? -r : r;
+}
+
+// Converts an RValue to a heap-allocated string representation.
+// The caller must free the returned string
+static inline char* RValue_toString(RValue val) {
+    char buf[64];
+    {
+        int numLen = RValue_formatNumberToBuf(val, buf);
+        if (numLen >= 0) return safeStrdup(buf);
+    }
+    switch (val.type) {
+        // REAL/INT32/INT64/BOOL are handled by RValue_formatNumberToBuf above.
         case RVALUE_STRING:
             return safeStrdup(val.string != nullptr ? val.string : "");
-        case RVALUE_BOOL:
-            return safeStrdup(val.int32 ? "1" : "0");
         case RVALUE_UNDEFINED:
             return safeStrdup("undefined");
         case RVALUE_ARRAY:
@@ -331,6 +407,8 @@ static inline char* RValue_toString(RValue val) {
         case RVALUE_ASSETREF:
             snprintf(buf, sizeof(buf), "%d", val.int32);
             return safeStrdup(buf);
+        default:
+            break; // numeric types returned above
     }
     return safeStrdup("");
 }
@@ -444,15 +522,30 @@ static inline GMLReal RValue_toReal(RValue val) {
     }
 }
 
+// Casting an out-of-range or NaN floating value to an integer is UB in C. x86's
+// cvttss2si quietly yields INT32_MIN, but the PSP's MIPS FPU RAISES an FPU exception
+// on the conversion — this froze the console on every huge-id PushEnv (DELTARUNE
+// passes int64-range instance ids through the float-real VM: battle start, save
+// star, save load). Reproduce the x86 result explicitly so every platform behaves
+// identically and nothing traps.
+static inline int32_t Real_castInt32(double v) {
+    if (!(v >= -2147483648.0 && v <= 2147483647.0)) return INT32_MIN; // NaN lands here too
+    return (int32_t) v;
+}
+static inline int64_t Real_castInt64(double v) {
+    if (!(v >= -9223372036854775808.0 && v < 9223372036854775808.0)) return INT64_MIN;
+    return (int64_t) v;
+}
+
 static inline int32_t RValue_toInt32(RValue val) {
     switch (val.type) {
-        case RVALUE_REAL:   return (int32_t) val.real;
+        case RVALUE_REAL:   return Real_castInt32((double) val.real);
         case RVALUE_INT32:  return val.int32;
 #ifndef NO_RVALUE_INT64
         case RVALUE_INT64:  return (int32_t) val.int64;
 #endif
         case RVALUE_BOOL:   return val.int32;
-        case RVALUE_STRING: return (int32_t) GMLReal_strtod(val.string, nullptr);
+        case RVALUE_STRING: return Real_castInt32(GMLReal_strtod(val.string, nullptr));
         case RVALUE_ARRAY:  return 0;
 #if IS_WAD17_OR_HIGHER_ENABLED
         case RVALUE_METHOD: return 0;
@@ -465,13 +558,13 @@ static inline int32_t RValue_toInt32(RValue val) {
 
 static inline int64_t RValue_toInt64(RValue val) {
     switch (val.type) {
-        case RVALUE_REAL:   return (int64_t) val.real;
+        case RVALUE_REAL:   return Real_castInt64((double) val.real);
         case RVALUE_INT32:  return (int64_t) val.int32;
 #ifndef NO_RVALUE_INT64
         case RVALUE_INT64:  return val.int64;
 #endif
         case RVALUE_BOOL:   return (int64_t) val.int32;
-        case RVALUE_STRING: return (int64_t) GMLReal_strtod(val.string, nullptr);
+        case RVALUE_STRING: return Real_castInt64(GMLReal_strtod(val.string, nullptr));
         case RVALUE_ARRAY:  return 0;
 #if IS_WAD17_OR_HIGHER_ENABLED
         case RVALUE_METHOD: return 0;

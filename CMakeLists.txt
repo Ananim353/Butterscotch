@@ -4,7 +4,27 @@ if(PLATFORM STREQUAL "ps3")
 set(CMAKE_TOOLCHAIN_FILE ${CMAKE_SOURCE_DIR}/cmake/ppu.cmake)
 endif()
 
+if(PLATFORM STREQUAL "vita")
+
+if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
+  if(DEFINED ENV{VITASDK})
+    set(CMAKE_TOOLCHAIN_FILE "$ENV{VITASDK}/share/vita.toolchain.cmake" CACHE PATH "toolchain file")
+  else()
+    message(FATAL_ERROR "Please define VITASDK to point to your SDK path!")
+  endif()
+endif()
+
+endif()
+
 project(butterscotch C)
+
+if (PLATFORM STREQUAL "vita")
+include("${VITASDK}/share/vita.cmake" REQUIRED)
+set(VITA_APP_NAME "Butterscotch")
+set(VITA_TITLEID  "BUTTRSTCH")
+set(VITA_VERSION  "01.00")
+set(VITA_MKSFOEX_FLAGS "-d ATTRIBUTE2=12")
+endif()
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -45,9 +65,6 @@ if(AUDIO_BACKEND STREQUAL "")
         set(AUDIO_BACKEND "openal")
     elseif(PLATFORM STREQUAL "ps2")
         set(AUDIO_BACKEND "ps2")
-    elseif(PLATFORM STREQUAL "psp")
-        # Phase 2: no audio yet (noop). A dedicated sceAudio backend lands in phase 5.
-        set(AUDIO_BACKEND "none")
     else()
         set(AUDIO_BACKEND "miniaudio")
     endif()
@@ -98,6 +115,7 @@ if(PLATFORM STREQUAL "web-meta")
     set(SOURCES
         src/data_win.c
         src/binary_reader.c
+		src/log.c
     )
 else()
     file(GLOB SOURCES src/*.c)
@@ -118,20 +136,20 @@ if(AUDIO_BACKEND STREQUAL "openal")
     add_compile_definitions(USE_OPENAL)
     if(APPLE)
         set(AUDIO_LIBRARIES "-framework OpenAL")
-    elseif(NOT PLATFORM STREQUAL "ps3")
+    elseif(NOT PLATFORM STREQUAL "ps3" AND NOT PLATFORM STREQUAL "vita")
         find_package(OpenAL REQUIRED)
         target_include_directories(butterscotch PUBLIC "${OPENAL_INCLUDE_DIR}")
         set(AUDIO_LIBRARIES "${OPENAL_LIBRARY}")
     endif()
 elseif(AUDIO_BACKEND STREQUAL "miniaudio")
-    target_include_directories(butterscotch PUBLIC vendor/miniaudio)
+    target_include_directories(butterscotch SYSTEM PUBLIC vendor/miniaudio)
     target_include_directories(butterscotch PUBLIC src/audio/miniaudio)
     add_compile_definitions(USE_MINIAUDIO)
     if (NOT WIN32)
         set(AUDIO_LIBRARIES pthread)
     endif()
 elseif(AUDIO_BACKEND STREQUAL "web")
-    target_include_directories(butterscotch PUBLIC vendor/miniaudio)
+    target_include_directories(butterscotch SYSTEM PUBLIC vendor/miniaudio)
     target_include_directories(butterscotch PUBLIC src/audio/web)
     target_include_directories(butterscotch PUBLIC src/audio/miniaudio)
     add_compile_definitions(USE_WEB_AUDIO)
@@ -207,6 +225,7 @@ if(PLATFORM STREQUAL "desktop")
     if (MSVC)
         target_include_directories(butterscotch PRIVATE ${CMAKE_SOURCE_DIR}/compat/getopt)
         add_compile_definitions(NO_STRTOK_R)
+        add_compile_definitions(NO_STRCASECMP)
     endif()
 
     # Butterscotch VM/interpreter profiler
@@ -687,96 +706,82 @@ elseif(PLATFORM STREQUAL "ps3")
     # mojoal calls SDL atomics/threads, so SDL2 must link after it (static link order)
     target_link_libraries(mojoal PUBLIC ${SDL2_LIBRARIES})
     target_link_libraries(butterscotch PRIVATE ${SDL2_LIBRARIES} m gcm_sys rsx sysutil io audio rt lv2 io audio bzip2 stb_ds sha1 ps3gl mojoal stb_vorbis)
-elseif(PLATFORM STREQUAL "psp")
-    file(GLOB DEBUG_FONT_SOURCES src/debug_font/*.c)
-    target_sources(butterscotch PRIVATE ${DEBUG_FONT_SOURCES})
-    target_include_directories(butterscotch PRIVATE ${CMAKE_SOURCE_DIR}/src/debug_font)
+elseif(PLATFORM STREQUAL "vita")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fdiagnostics-color=always -g -Wall -O3 -mfloat-abi=hard -mtune=cortex-a9 -mfpu=neon -ffast-math")
+    set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -fdiagnostics-color=always -Wno-write-strings -std=c++11")
 
-    # Runtime TXTR decode (QOI / BZ2+QOI / PNG) for the sceGu texture cache
-    file(GLOB IMAGE_SOURCES src/image/*.c)
-    target_sources(butterscotch PRIVATE ${IMAGE_SOURCES})
-    target_include_directories(butterscotch PRIVATE ${CMAKE_SOURCE_DIR}/src/image)
-
-    # OGG decode for the sceAudio backend (stb_vorbis implementation)
-    target_sources(butterscotch PRIVATE ${CMAKE_SOURCE_DIR}/vendor/stb/vorbis/stb_vorbis.c)
-    set_source_files_properties(${CMAKE_SOURCE_DIR}/vendor/stb/vorbis/stb_vorbis.c PROPERTIES COMPILE_FLAGS "-w")
-
-    # The PSP Allegrex FPU is single-precision only, so double is software-emulated.
-    add_compile_definitions(USE_FLOAT_REALS)
-    # ...which is exactly why stb_vorbis's table setup (compute_twiddle_factors /
-    # compute_window) costs ~110ms per open here: ~5184 software-emulated double sin/cos.
-    # This flips them to hardware-FPU cosf/sinf (the results are cast to float regardless),
-    # PSP-only so the desktop backends keep the original double path bit-for-bit.
-    add_compile_definitions(STBV_FAST_SETUP_TRIG)
-    # A particle is ~48 bytes with float GMLReal, so the 8192 default would reserve 393KB per
-    # system on a machine already rationing tile memory. DELTARUNE's heaviest system peaks at
-    # 89 live particles, so 1024 is still an order of magnitude of headroom for 48KB.
-    add_compile_definitions(PARTICLE_SYSTEM_MAX_PARTICLES=1024)
-    # Counts sin/cos per PERF window (see real_type.h). Measured at 2-3 calls/frame in the
-    # overworld, so the VFPU is not worth wiring in there — kept enabled to answer the same
-    # question for scenes not yet profiled. Costs one increment per call.
-    add_compile_definitions(BS_TRIG_COUNT)
-    # Disabling Int64 support fits the entire RValue struct in 8 bytes, saving memory
-    # and cycles on the memory-constrained PSP (same tradeoff as the PS2 target).
+    # Normally, __VITA__ should already be defined, but for some reason,
+    # in my case, this didn't really work... so just in case, when we're
+    # building for the Vita, just force-feed these...
+    add_compile_definitions(__VITA__)
+    add_compile_definitions(MA_NO_RUNTIME_LINKING)
+    add_compile_definitions(PLATFORM_VITA)
     add_compile_definitions(NO_RVALUE_INT64)
-    # Platform identifier for PSP-specific code paths
-    add_compile_definitions(PLATFORM_PSP)
 
-    # Trim optional VM diagnostics to save code size / cycles on the handheld
-    option(ENABLE_VM_GML_PROFILER "Enable Butterscotch VM/interpreter profiler" OFF)
-    if(ENABLE_VM_GML_PROFILER)
-        add_compile_definitions(ENABLE_VM_GML_PROFILER)
-    endif()
-    option(ENABLE_VM_TRACING "Enable Butterscotch VM/interpreter tracing checks" OFF)
-    if(ENABLE_VM_TRACING)
-        add_compile_definitions(ENABLE_VM_TRACING)
-    endif()
-    option(ENABLE_VM_OPCODE_PROFILER "Enable Butterscotch VM opcode count profiler" OFF)
-    if(ENABLE_VM_OPCODE_PROFILER)
-        add_compile_definitions(ENABLE_VM_OPCODE_PROFILER)
-    endif()
-    option(ENABLE_VM_STUB_LOGS "Enable VM unknown/stubbed function logs" OFF)
-    if(ENABLE_VM_STUB_LOGS)
-        add_compile_definitions(ENABLE_VM_STUB_LOGS)
-    endif()
-    # VMPROF (ops/builtin-timing/varlk) — was always-on under PLATFORM_PSP and cost a
-    # per-instruction 64-bit RMW plus a syscall pair every 16th builtin call, on the
-    # hottest loops. OFF by default so shipping builds pay nothing; -DENABLE_VMPROF=ON
-    # for a VM-profiling session (adds the VMPROF/VMPROFTOP trace lines back).
-    option(ENABLE_VMPROF "Enable Butterscotch VM ops/builtin/varlk profiler (PSP)" OFF)
-    if(ENABLE_VMPROF)
-        add_compile_definitions(ENABLE_VMPROF)
-    endif()
-
-    # Treat unsuffixed float constants as single-precision to avoid float->double
-    # promotions on a target with no hardware double. Frees a register with
-    # -fomit-frame-pointer; -ffast-math enables aggressive FP optimizations.
-    target_compile_options(butterscotch PRIVATE -fsingle-precision-constant -fomit-frame-pointer -ffast-math -Wno-format)
-
-    # stb_image (texture decode) + stb_vorbis (OGG) for the later render/audio phases
+    file(GLOB GL_SOURCES src/gl/*.c src/gl_legacy/*.c src/gl_common/*.c src/image/*.c)
+    file(GLOB DEBUG_FONT_SOURCES src/debug_font/*.c)
+    target_sources(butterscotch PRIVATE ${GL_SOURCES} ${DEBUG_FONT_SOURCES})
+    target_include_directories(butterscotch PRIVATE ${CMAKE_SOURCE_DIR}/src/gl)
+    target_include_directories(butterscotch PRIVATE ${CMAKE_SOURCE_DIR}/src/gl_legacy)
+    target_include_directories(butterscotch PRIVATE ${CMAKE_SOURCE_DIR}/src/gl_common)
+    target_include_directories(butterscotch PRIVATE ${CMAKE_SOURCE_DIR}/src/image)
+    target_include_directories(butterscotch PRIVATE ${CMAKE_SOURCE_DIR}/src/debug_font)
+    target_include_directories(butterscotch PRIVATE ${CMAKE_SOURCE_DIR}/src/vita)
+    
     target_include_directories(butterscotch PUBLIC vendor/stb/image)
     target_include_directories(butterscotch PUBLIC vendor/stb/vorbis)
+    
+    option(ENABLE_VM_GML_PROFILER "Enable Butterscotch VM/interpreter profiler" OFF)
+    option(ENABLE_VM_TRACING "Enable Butterscotch VM/interpreter tracing checks" OFF)
+    option(ENABLE_VM_OPCODE_PROFILER "Enable Butterscotch VM opcode count profiler" OFF)
+    option(ENABLE_SPATIAL_GRID_LOGS "Enable Spatial Grid logs" OFF)
+    option(ENABLE_VM_STUB_LOGS "Enable VM unknown/stubbed function logs" OFF)
+    
+    target_sources(butterscotch PRIVATE src/vita/vita_textures.c src/vita/main.c)
+    
+    target_link_libraries(butterscotch PRIVATE 
+        -Wl,--whole-archive pthread -Wl,--no-whole-archive
+        bzip2
+        stb_ds
+        sha1
+        #stb_image
+        #stb_vorbis
+        vitaGL
+        openal
+        stdc++
+        vitashark
+        m
+        z
+        SceShaccCgExt
+        mathneon
+        taihen_stub
+        kubridge_stub
+        SceAppMgr_stub
+        SceAppUtil_stub
+        SceAudio_stub
+        SceAudioIn_stub
+        SceCtrl_stub
+        SceCommonDialog_stub
+        SceDisplay_stub
+        SceKernelDmacMgr_stub
+        SceFios2_stub
+        SceGxm_stub
+        SceMotion_stub
+        SceNet_stub
+        SceRegistryMgr_stub
+        SceShaccCg_stub
+        SceSysmodule_stub
+        ScePower_stub
+        SceTouch_stub
+        SceVshBridge_stub
+        SceAvPlayer_stub
+        SceNpTrophy_stub
+    )
 
-    # PSPSDK libraries. Dependents listed before dependencies for left-to-right
-    # static resolution (pspgum->pspgu, pspaudiolib->pspaudio).
-    target_link_libraries(butterscotch PRIVATE
-        pspgum pspgu
-        pspaudiolib pspaudio
-        pspatrac3 psputility
-        psprtc # date_current_datetime: DELTARUNE stamps every save with the wall clock
-        pspdebug pspdisplay pspge pspctrl psppower
-        m stb_ds sha1 bzip2 stb_vorbis)
-
-    # Package the ELF into a bootable EBOOT.PBP (macro provided by pspdev.cmake).
-    # ICON_PATH = XMB list icon (144x80), BACKGROUND_PATH = cover art shown behind the
-    # game info (480x272). Assets live in psp-assets/ so they travel with the repo.
-    create_pbp_file(
-        TARGET butterscotch
-        TITLE "DELTARUNE"
-        ICON_PATH ${CMAKE_SOURCE_DIR}/psp-assets/ICON0.PNG
-        BACKGROUND_PATH ${CMAKE_SOURCE_DIR}/psp-assets/PIC1.PNG
-        MUSIC_PATH ${CMAKE_SOURCE_DIR}/psp-assets/SND0.AT3
-        OUTPUT_DIR ${CMAKE_BINARY_DIR}
+    vita_create_self(eboot.bin butterscotch UNSAFE)
+    vita_create_vpk(Butterscotch.vpk ${VITA_TITLEID} eboot.bin
+        VERSION ${VITA_VERSION}
+        NAME ${VITA_APP_NAME}
     )
 else()
     message(FATAL_ERROR "Unknown platform! ${PLATFORM}")

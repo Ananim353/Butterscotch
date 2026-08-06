@@ -10970,6 +10970,161 @@ static RValue builtin_draw_triangle_color(VMContext* ctx, RValue* args, MAYBE_UN
     return RValue_makeUndefined();
 }
 
+// ===[ Primitive Builder ]===
+//
+// draw_primitive_begin(_texture) opens a primitive, draw_vertex* appends to it and
+// draw_primitive_end submits it. Vertices are collected on the renderer and only turned into
+// geometry at the end, so strips and fans are decomposed here once instead of in every backend.
+
+static bool primEnsureCapacity(Renderer* renderer, int32_t needed) {
+    if (needed <= renderer->primVertCapacity) return true;
+    int32_t capacity = 0 < renderer->primVertCapacity ? renderer->primVertCapacity : 64;
+    while (capacity < needed) {
+        if (capacity > INT32_MAX / 2) return false;
+        capacity *= 2;
+    }
+    renderer->primVerts = (PrimitiveVertex*) safeRealloc(renderer->primVerts, (size_t) capacity * sizeof(PrimitiveVertex));
+    renderer->primVertCapacity = capacity;
+    return true;
+}
+
+static void primPushVertex(VMContext* ctx, float x, float y, float u, float v, uint32_t color, float alpha) {
+    Runner* runner = ctx->runner;
+    Renderer* renderer = runner->renderer;
+    // A vertex outside begin/end is a no-op in GML rather than an error.
+    if (renderer == nullptr || renderer->primKind == 0) return;
+    if (!primEnsureCapacity(renderer, renderer->primVertCount + 1)) return;
+    if (runner->applyOffsetForPrimitives) {
+        x += 1.0f; y += 1.0f;
+    }
+    PrimitiveVertex* vertex = &renderer->primVerts[renderer->primVertCount++];
+    vertex->x = x;
+    vertex->y = y;
+    vertex->u = u;
+    vertex->v = v;
+    vertex->color = color;
+    vertex->alpha = alpha;
+}
+
+static void primEmitTriangle(Renderer* renderer, const PrimitiveVertex* a, const PrimitiveVertex* b, const PrimitiveVertex* c) {
+    if (renderer->vtable->drawPrimitiveTriangle != nullptr) {
+        PrimitiveVertex triangle[3] = {*a, *b, *c};
+        renderer->vtable->drawPrimitiveTriangle(renderer, renderer->primTexture, triangle);
+        return;
+    }
+    // Backend without primitive support: the shape still appears, but untextured and with one
+    // averaged alpha instead of a per-vertex gradient.
+    renderer->vtable->drawTriangle(renderer, a->x, a->y, b->x, b->y, c->x, c->y,
+                                   a->color, b->color, c->color, (a->alpha + b->alpha + c->alpha) / 3.0f, false);
+}
+
+static void primEmitLine(Renderer* renderer, const PrimitiveVertex* a, const PrimitiveVertex* b) {
+    renderer->vtable->drawLineColor(renderer, a->x, a->y, b->x, b->y, 1.0f, a->color, b->color, a->alpha);
+}
+
+// draw_primitive_begin(kind)
+static RValue builtin_draw_primitive_begin(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Renderer* renderer = ctx->runner->renderer;
+    if (renderer != nullptr) {
+        renderer->primKind = RValue_toInt32(args[0]);
+        renderer->primTexture = 0;
+        renderer->primVertCount = 0;
+    }
+    return RValue_makeUndefined();
+}
+
+// draw_primitive_begin_texture(kind, texture)
+static RValue builtin_draw_primitive_begin_texture(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Renderer* renderer = ctx->runner->renderer;
+    if (renderer != nullptr) {
+        int32_t texHandle = RValue_toInt32(args[1]);
+        renderer->primKind = RValue_toInt32(args[0]);
+        renderer->primTexture = 0 < texHandle ? (uint32_t) texHandle : 0;  // -1 means "no texture"
+        renderer->primVertCount = 0;
+    }
+    return RValue_makeUndefined();
+}
+
+// draw_vertex(x, y)
+static RValue builtin_draw_vertex(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Renderer* renderer = ctx->runner->renderer;
+    if (renderer != nullptr) {
+        primPushVertex(ctx, (float) RValue_toReal(args[0]), (float) RValue_toReal(args[1]),
+                       0.0f, 0.0f, renderer->drawColor, renderer->drawAlpha);
+    }
+    return RValue_makeUndefined();
+}
+
+// draw_vertex_color(x, y, color, alpha)
+static RValue builtin_draw_vertex_color(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    primPushVertex(ctx, (float) RValue_toReal(args[0]), (float) RValue_toReal(args[1]), 0.0f, 0.0f,
+                   (uint32_t) RValue_toInt32(args[2]), (float) RValue_toReal(args[3]));
+    return RValue_makeUndefined();
+}
+
+// draw_vertex_texture(x, y, u, v)
+static RValue builtin_draw_vertex_texture(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Renderer* renderer = ctx->runner->renderer;
+    if (renderer != nullptr) {
+        primPushVertex(ctx, (float) RValue_toReal(args[0]), (float) RValue_toReal(args[1]),
+                       (float) RValue_toReal(args[2]), (float) RValue_toReal(args[3]),
+                       renderer->drawColor, renderer->drawAlpha);
+    }
+    return RValue_makeUndefined();
+}
+
+// draw_vertex_texture_color(x, y, u, v, color, alpha)
+static RValue builtin_draw_vertex_texture_color(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    primPushVertex(ctx, (float) RValue_toReal(args[0]), (float) RValue_toReal(args[1]),
+                   (float) RValue_toReal(args[2]), (float) RValue_toReal(args[3]),
+                   (uint32_t) RValue_toInt32(args[4]), (float) RValue_toReal(args[5]));
+    return RValue_makeUndefined();
+}
+
+// draw_primitive_end()
+static RValue builtin_draw_primitive_end(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Renderer* renderer = ctx->runner->renderer;
+    if (renderer == nullptr || renderer->primKind == 0) return RValue_makeUndefined();
+
+    const PrimitiveVertex* verts = renderer->primVerts;
+    int32_t count = renderer->primVertCount;
+    switch (renderer->primKind) {
+        case pr_pointlist:
+            for (int32_t i = 0; i < count; i++) {
+                renderer->vtable->drawRectangle(renderer, verts[i].x, verts[i].y, verts[i].x, verts[i].y,
+                                                verts[i].color, verts[i].alpha, false);
+            }
+            break;
+        case pr_linelist:
+            for (int32_t i = 0; i + 1 < count; i += 2) primEmitLine(renderer, &verts[i], &verts[i + 1]);
+            break;
+        case pr_linestrip:
+            for (int32_t i = 0; i + 1 < count; i++) primEmitLine(renderer, &verts[i], &verts[i + 1]);
+            break;
+        case pr_trianglelist:
+            for (int32_t i = 0; i + 2 < count; i += 3) primEmitTriangle(renderer, &verts[i], &verts[i + 1], &verts[i + 2]);
+            break;
+        case pr_trianglestrip:
+            // Odd triangles swap their first two vertices, the same way a GPU keeps a strip's
+            // winding consistent. We don't cull, but shaders and future backends may.
+            for (int32_t i = 0; i + 2 < count; i++) {
+                if ((i & 1) == 0) primEmitTriangle(renderer, &verts[i], &verts[i + 1], &verts[i + 2]);
+                else primEmitTriangle(renderer, &verts[i + 1], &verts[i], &verts[i + 2]);
+            }
+            break;
+        case pr_trianglefan:
+            for (int32_t i = 1; i + 1 < count; i++) primEmitTriangle(renderer, &verts[0], &verts[i], &verts[i + 1]);
+            break;
+        default:
+            break;
+    }
+
+    renderer->primKind = 0;
+    renderer->primVertCount = 0;
+    renderer->primTexture = 0;
+    return RValue_makeUndefined();
+}
+
 // draw_circle(x, y, r, outline)
 static RValue builtin_draw_circle(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
     Runner* runner = ctx->runner;
@@ -18187,6 +18342,15 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "draw_triangle", builtin_draw_triangle);
     VM_registerBuiltin(ctx, "draw_triangle_colour", builtin_draw_triangle_color);
     VM_registerBuiltin(ctx, "draw_triangle_color", builtin_draw_triangle_color);
+    VM_registerBuiltin(ctx, "draw_primitive_begin", builtin_draw_primitive_begin);
+    VM_registerBuiltin(ctx, "draw_primitive_begin_texture", builtin_draw_primitive_begin_texture);
+    VM_registerBuiltin(ctx, "draw_primitive_end", builtin_draw_primitive_end);
+    VM_registerBuiltin(ctx, "draw_vertex", builtin_draw_vertex);
+    VM_registerBuiltin(ctx, "draw_vertex_color", builtin_draw_vertex_color);
+    VM_registerBuiltin(ctx, "draw_vertex_colour", builtin_draw_vertex_color);
+    VM_registerBuiltin(ctx, "draw_vertex_texture", builtin_draw_vertex_texture);
+    VM_registerBuiltin(ctx, "draw_vertex_texture_color", builtin_draw_vertex_texture_color);
+    VM_registerBuiltin(ctx, "draw_vertex_texture_colour", builtin_draw_vertex_texture_color);
     VM_registerBuiltin(ctx, "draw_circle", builtin_draw_circle);
     VM_registerBuiltin(ctx, "draw_circle_colour", builtin_draw_circle_color);
     VM_registerBuiltin(ctx, "draw_circle_color", builtin_draw_circle_color);

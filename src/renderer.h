@@ -75,6 +75,24 @@ typedef struct {
     int32_t dstAlpha;
 } BlendFactors;
 
+// GML primitive kinds, as passed to draw_primitive_begin / vertex_submit.
+#define pr_pointlist     1
+#define pr_linelist      2
+#define pr_linestrip     3
+#define pr_trianglelist  4
+#define pr_trianglestrip 5
+#define pr_trianglefan   6
+
+// One vertex of a user-built primitive (draw_primitive_begin .. draw_primitive_end).
+// Colour and alpha are per-vertex: GML fades a strip by varying them along it, so a
+// single per-triangle alpha is not enough (obj_wind_trail in DELTARUNE does exactly this).
+typedef struct {
+    float x, y;
+    float u, v;      // 0..1 inside the source sprite/surface; ignored when the primitive is untextured
+    uint32_t color;  // BGR, same packing as Renderer.drawColor
+    float alpha;
+} PrimitiveVertex;
+
 typedef struct {
     void (*init)(Renderer* renderer, DataWin* dataWin);
     void (*destroy)(Renderer* renderer);
@@ -97,6 +115,10 @@ typedef struct {
     void (*drawRectangleColor)(Renderer* renderer, float x1, float y1, float x2, float y2, uint32_t color1, uint32_t color2, uint32_t color3, uint32_t color4, float alpha, bool outline);
     void (*drawLine)(Renderer* renderer, float x1, float y1, float x2, float y2, float width, uint32_t color, float alpha);
     void (*drawTriangle)(Renderer *renderer, float x1, float y1, float x2, float y2, float x3, float y3, uint32_t color1, uint32_t color2, uint32_t color3, float alpha, bool outline);
+    // One triangle of a user-built primitive: per-vertex colour AND alpha, optionally textured.
+    // texHandle is a sprite_get_texture/surface_get_texture handle, or 0 for untextured.
+    // May be NULL: callers fall back to drawTriangle, which loses per-vertex alpha and the texture.
+    void (*drawPrimitiveTriangle)(Renderer* renderer, uint32_t texHandle, const PrimitiveVertex* verts);
     void (*drawLineColor)(Renderer* renderer, float x1, float y1, float x2, float y2, float width, uint32_t color1, uint32_t color2, float alpha);
     void (*drawText)(Renderer* renderer, const char* text, float x, float y, float xscale, float yscale, float angleDeg, float lineSeparation);
     void (*drawTextColor)(Renderer* renderer, const char* text, float x, float y, float xscale, float yscale, float angleDeg, int32_t c1, int32_t c2, int32_t c3, int32_t c4, float alpha, float lineSeparation);
@@ -187,6 +209,15 @@ struct Renderer {
     int32_t currentShader;
     BlendFactors blendFactors;
     int32_t cameraCurrent;
+
+    // draw_primitive_begin .. draw_primitive_end builder state.
+    // The vertex buffer is grown on demand and kept for reuse: one allocation per renderer,
+    // reset (not freed) by every draw_primitive_begin.
+    PrimitiveVertex* primVerts;
+    int32_t primVertCount;
+    int32_t primVertCapacity;
+    int32_t primKind;         // pr_* constant; 0 when no primitive is open
+    uint32_t primTexture;     // texture handle, 0 = untextured
 };
 
 // ===[ Shared Helpers (platform-agnostic) ]===

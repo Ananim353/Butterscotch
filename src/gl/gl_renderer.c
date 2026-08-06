@@ -2649,6 +2649,41 @@ static bool glTextureGetUVs(Renderer* renderer, uint32_t texHandle, float* outUV
     return true;
 }
 
+static void glDrawPrimitiveTriangle(Renderer* renderer, uint32_t texHandle, const PrimitiveVertex* verts) {
+    GLRenderer* gl = (GLRenderer*) renderer;
+
+    // Untextured primitives sample the 1x1 white texture, like every other flat-shaded shape here.
+    GLuint texId = gl->whiteTexture;
+    float uvs[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+    if (texHandle != 0) {
+        TexturePageItem* tpag;
+        GLuint handleTexId;
+        int32_t texW, texH;
+        if (glResolveTextureHandle(gl, texHandle, &tpag, &handleTexId, &texW, &texH)) {
+            texId = handleTexId;
+            // GML hands us UVs in 0..1 of the sprite; map them onto its slot in the texture page.
+            glTextureGetUVs(renderer, texHandle, uvs);
+        }
+    }
+    float uSpan = uvs[2] - uvs[0];
+    float vSpan = uvs[3] - uvs[1];
+
+    flushIfNeededAndSetActiveState(gl, BATCHTYPE_TRIANGLE, texId);
+
+    Vertex* out = gl->vertexData + gl->batchCount * VERTICES_PER_TRIANGLE;
+    for (int32_t i = 0; i < 3; i++) {
+        out[i].x = verts[i].x;
+        out[i].y = verts[i].y;
+        out[i].u = uvs[0] + (verts[i].u * uSpan);
+        out[i].v = uvs[1] + (verts[i].v * vSpan);
+        out[i].r = (uint8_t) BGR_R(verts[i].color);
+        out[i].g = (uint8_t) BGR_G(verts[i].color);
+        out[i].b = (uint8_t) BGR_B(verts[i].color);
+        out[i].a = floatToUnormByte(verts[i].alpha);
+    }
+    gl->batchCount++;
+}
+
 static bool glShaderIsCompiled(Renderer* renderer, int32_t shaderID) {
     GLRenderer* gl = (GLRenderer*) renderer;
     DataWin* dw = gl->base.dataWin;
@@ -2711,6 +2746,7 @@ Renderer* GLRenderer_create(void) {
     glVtable.drawLine = glDrawLine;
     glVtable.drawLineColor = glDrawLineColor;
     glVtable.drawTriangle = glDrawTriangle;
+    glVtable.drawPrimitiveTriangle = glDrawPrimitiveTriangle;
     glVtable.drawText = glDrawText;
     glVtable.drawTextColor = glDrawTextColor;
     glVtable.flush = glRendererFlush;

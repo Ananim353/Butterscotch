@@ -1909,6 +1909,39 @@ static bool glTextureGetUVs(Renderer* renderer, uint32_t texHandle, float* outUV
 static void glTextureSetStage(MAYBE_UNUSED Renderer* renderer, MAYBE_UNUSED int32_t slot, MAYBE_UNUSED uint32_t texHandle) {
 }
 
+static void glDrawPrimitiveTriangle(Renderer* renderer, uint32_t texHandle, const PrimitiveVertex* verts) {
+    GLLegacyRenderer* gl = (GLLegacyRenderer*) renderer;
+
+    // Untextured primitives sample the 1x1 white texture, like every other flat-shaded shape here.
+    GLuint texId = gl->whiteTexture;
+    float uvs[4] = {0.5f, 0.5f, 0.5f, 0.5f};
+    if (texHandle != 0) {
+        TexturePageItem* tpag;
+        int32_t w = 0, h = 0;
+        if (glLegacyResolveTextureHandle(gl, texHandle, &tpag, &w, &h) && glTextureGetUVs(renderer, texHandle, uvs)) {
+            if (tpag == nullptr) {
+                uint32_t sid = texHandle & ~GL_SURFACE_TEXTURE_FLAG;
+                texId = gl->surfaceTexture[sid];
+            } else if (0 <= tpag->texturePageId && (uint32_t) tpag->texturePageId < gl->textureCount) {
+                texId = gl->glTextures[tpag->texturePageId];
+            }
+        }
+    }
+    float uSpan = uvs[2] - uvs[0];
+    float vSpan = uvs[3] - uvs[1];
+
+    glBindTexture(GL_TEXTURE_2D, texId);
+    glBegin(GL_TRIANGLES);
+    for (int32_t i = 0; i < 3; i++) {
+        glColor4f((float) BGR_R(verts[i].color) / 255.0f, (float) BGR_G(verts[i].color) / 255.0f,
+                  (float) BGR_B(verts[i].color) / 255.0f, verts[i].alpha);
+        // GML hands us UVs in 0..1 of the sprite; map them onto its slot in the texture page.
+        glTexCoord2f(uvs[0] + (verts[i].u * uSpan), uvs[1] + (verts[i].v * vSpan));
+        glVertex2f(verts[i].x, verts[i].y);
+    }
+    glEnd();
+}
+
 static void glGpuSetShader(MAYBE_UNUSED Renderer* renderer, MAYBE_UNUSED int32_t shaderIndex) {}
 static void glGpuResetShader(MAYBE_UNUSED Renderer* renderer) {}
 static int32_t glShaderGetUniform(MAYBE_UNUSED Renderer* renderer, MAYBE_UNUSED int32_t shaderIndex, MAYBE_UNUSED char* uniform) { return -1; }
@@ -1945,6 +1978,7 @@ Renderer* GLLegacyRenderer_create(void) {
     glVtable.drawLine = glDrawLine;
     glVtable.drawLineColor = glDrawLineColor;
     glVtable.drawTriangle = glDrawTriangle;
+    glVtable.drawPrimitiveTriangle = glDrawPrimitiveTriangle;
     glVtable.drawText = glDrawText;
     glVtable.drawTextColor = glDrawTextColor;
     glVtable.flush = glRendererFlush;

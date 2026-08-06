@@ -1854,6 +1854,28 @@ void VMBuiltins_setVariable(VMContext* ctx, Instance* inst, int16_t builtinVarId
 
 // ===[ BUILTIN FUNCTION IMPLEMENTATIONS ]===
 
+// show_message(text): a modal dialog in the runner. We have no dialog to show and blocking the
+// game would be worse than not, so it goes to the log.
+static RValue builtin_show_message(MAYBE_UNUSED VMContext* ctx, RValue* args, int32_t argCount) {
+    if (1 > argCount) return RValue_makeUndefined();
+    char* text = RValue_toString(args[0]);
+    logInfo("Game (show_message): %s\n", text);
+    free(text);
+    return RValue_makeUndefined();
+}
+
+// show_error(text, abort): same, but honours the abort flag -- swallowing a fatal error would hide
+// the reason the game wanted to stop.
+static RValue builtin_show_error(MAYBE_UNUSED VMContext* ctx, RValue* args, int32_t argCount) {
+    if (1 > argCount) return RValue_makeUndefined();
+    char* text = RValue_toString(args[0]);
+    bool fatal = argCount >= 2 && RValue_toBool(args[1]);
+    logError("Game (show_error): %s\n", text);
+    free(text);
+    if (fatal) abort();
+    return RValue_makeUndefined();
+}
+
 static RValue builtin_show_debug_message(MAYBE_UNUSED VMContext* ctx, RValue* args, int32_t argCount) {
     if (1 > argCount) {
         logWarn("[show_debug_message] Expected at least 1 argument\n");
@@ -2084,6 +2106,11 @@ static RValue builtin_log2(MAYBE_UNUSED VMContext* ctx, RValue* args, int32_t ar
     return RValue_makeReal(GMLReal_log2(RValue_toReal(args[0])));
 }
 
+static RValue builtin_log10(MAYBE_UNUSED VMContext* ctx, RValue* args, int32_t argCount) {
+    if (1 > argCount) return RValue_makeReal(0.0);
+    return RValue_makeReal(GMLReal_log10(RValue_toReal(args[0])));
+}
+
 static RValue builtin_sqr(MAYBE_UNUSED VMContext* ctx, RValue* args, int32_t argCount) {
     if (1 > argCount) return RValue_makeReal(0.0);
     GMLReal val = RValue_toReal(args[0]);
@@ -2201,6 +2228,42 @@ static RValue builtin_typeof(MAYBE_UNUSED VMContext* ctx, RValue* args, int32_t 
 }
 
 // ===[ STRING FUNCTIONS ]===
+
+// Characters trimmed by string_trim_* when no explicit set is given, matching the runner:
+// space, tab, CR, LF, vertical tab, form feed.
+static bool stringTrimIsDefaultWhitespace(char c) {
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f';
+}
+
+// string_trim_start(str, [chars]): drops leading whitespace, or leading characters taken from the
+// optional array. Only the first byte of each entry is honoured, which covers the ASCII sets GML
+// scripts pass here.
+static RValue builtin_string_trim_start(MAYBE_UNUSED VMContext* ctx, RValue* args, int32_t argCount) {
+    if (1 > argCount) return RValue_makeOwnedString(safeStrdup(""));
+    char* str = RValue_toString(args[0]);
+    const char* cursor = str;
+    if (argCount >= 2 && args[1].type == RVALUE_ARRAY && args[1].array != nullptr) {
+        GMLArray* set = args[1].array;
+        int32_t setLen = GMLArray_length1D(set);
+        bool trimmed = true;
+        while (*cursor != '\0' && trimmed) {
+            trimmed = false;
+            for (int32_t i = 0; i < setLen; i++) {
+                RValue entry = GMLArray_get(set, i);
+                if (entry.type == RVALUE_STRING && entry.string != nullptr && entry.string[0] == *cursor) {
+                    cursor++;
+                    trimmed = true;
+                    break;
+                }
+            }
+        }
+    } else {
+        while (stringTrimIsDefaultWhitespace(*cursor)) cursor++;
+    }
+    char* result = safeStrdup(cursor);
+    free(str);
+    return RValue_makeOwnedString(result);
+}
 
 static RValue builtin_string_upper(MAYBE_UNUSED VMContext* ctx, RValue* args, int32_t argCount) {
     if (1 > argCount) return RValue_makeOwnedString(safeStrdup(""));
@@ -2753,6 +2816,14 @@ static RValue builtin_point_distance(MAYBE_UNUSED VMContext* ctx, RValue* args, 
     return RValue_makeReal(GMLReal_sqrt(dx * dx + dy * dy));
 }
 
+static RValue builtin_point_distance_3d(MAYBE_UNUSED VMContext* ctx, RValue* args, int32_t argCount) {
+    if (6 > argCount) return RValue_makeReal(0.0);
+    GMLReal dx = RValue_toReal(args[3]) - RValue_toReal(args[0]);
+    GMLReal dy = RValue_toReal(args[4]) - RValue_toReal(args[1]);
+    GMLReal dz = RValue_toReal(args[5]) - RValue_toReal(args[2]);
+    return RValue_makeReal(GMLReal_sqrt(dx * dx + dy * dy + dz * dz));
+}
+
 static RValue builtin_point_in_rectangle(MAYBE_UNUSED VMContext* ctx, RValue* args, int32_t argCount) {
     if (6 > argCount) return RValue_makeBool(false);
     GMLReal px = RValue_toReal(args[0]);
@@ -3201,6 +3272,14 @@ static RValue builtin_choose(MAYBE_UNUSED VMContext* ctx, RValue* args, int32_t 
 static RValue builtin_randomize(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
     if (ctx->hasFixedSeed) return RValue_makeUndefined();
     srand((unsigned int) time(nullptr) + (ctx->runner->frameCount * 2654435761u)); // 2654435761u = Knuth's multiplier
+    return RValue_makeUndefined();
+}
+
+// random_set_seed(seed). Honoured even under --fixed-seed, unlike randomize(): games call this to
+// make a layout reproducible, so ignoring it would remove determinism rather than add it.
+static RValue builtin_random_set_seed(MAYBE_UNUSED VMContext* ctx, RValue* args, int32_t argCount) {
+    if (1 > argCount) return RValue_makeUndefined();
+    srand((unsigned int) RValue_toInt32(args[0]));
     return RValue_makeUndefined();
 }
 
@@ -4232,6 +4311,13 @@ static RValue builtin_os_get_language(MAYBE_UNUSED VMContext* ctx, MAYBE_UNUSED 
     return RValue_makeOwnedString(safeStrdup("en"));
 }
 
+// os_get_info(): the runner returns a ds_map of platform details, or -1 where there are none.
+// We have nothing platform-specific to report, and -1 is the documented "no info" answer that
+// callers already branch on -- returning an empty map would make them read absent keys instead.
+static RValue builtin_os_get_info(MAYBE_UNUSED VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    return RValue_makeReal(-1.0);
+}
+
 static RValue builtin_os_get_region(MAYBE_UNUSED VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
     return RValue_makeOwnedString(safeStrdup("US"));
 }
@@ -4532,6 +4618,29 @@ static RValue builtin_ds_map_exists(VMContext* ctx, RValue* args, int32_t argCou
     ptrdiff_t idx = getValueIndexInMap(mapPtr, args[1]);
 
     return RValue_makeReal(idx >= 0 ? 1.0 : 0.0);
+}
+
+// ds_map_keys_to_array(map, [array]): appends every key to the given array, or to a fresh one.
+static RValue builtin_ds_map_keys_to_array(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (1 > argCount) return RValue_makeUndefined();
+    DsMapEntry** mapPtr = dsMapGet(ctx->runner, RValue_toInt32(args[0]));
+
+    GMLArray* out;
+    int32_t count = 0;
+    if (argCount >= 2 && args[1].type == RVALUE_ARRAY && args[1].array != nullptr) {
+        out = args[1].array;
+        count = GMLArray_length1D(out);
+    } else {
+        out = GMLArray_create(ctx->dataWin->gen8.wadVersion, 0);
+    }
+    if (mapPtr != nullptr) {
+        for (int32_t i = 0; i < (int32_t) shlen(*mapPtr); i++) {
+            GMLArray_growTo(out, count + 1);
+            *GMLArray_slot(out, count) = RValue_makeOwnedString(safeStrdup((*mapPtr)[i].key));
+            count++;
+        }
+    }
+    return RValue_makeArray(out);
 }
 
 static RValue builtin_ds_map_find_first(VMContext* ctx, RValue* args, int32_t argCount) {
@@ -5056,6 +5165,45 @@ static RValue builtin_ds_list_write(VMContext* ctx, RValue* args, MAYBE_UNUSED i
     dsStreamAppendU32(&buf, (uint32_t) len);
     dsStreamAppendValues(&buf, list->items, len);
     return dsStreamFinishToHexString(buf);
+}
+
+// ds_list_set(list, pos, value): like ds_list_replace, but a position past the end grows the list,
+// padding the gap with 0 -- this is the accessor form (list[| i] = v) and GML pads the same way.
+static RValue builtin_ds_list_set(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (3 > argCount) return RValue_makeUndefined();
+    Runner* runner = ctx->runner;
+    int32_t pos = RValue_toInt32(args[1]);
+    DsList* list = dsListGet(runner, RValue_toInt32(args[0]));
+    if (list == nullptr || 0 > pos) return RValue_makeUndefined();
+    while (pos >= (int32_t) arrlen(list->items)) arrput(list->items, RValue_makeReal(0.0));
+    RValue_free(&list->items[pos]);
+    list->items[pos] = RValue_makeIndependent(args[2]);
+    return RValue_makeUndefined();
+}
+
+static int arraySortDefaultOrder(const RValue* a, const RValue* b);  // defined with array_sort
+
+// ds_list_sort(list, ascending): insertion sort with the same ordering as array_sort
+// (numbers before strings, strings by strcmp).
+static RValue builtin_ds_list_sort(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (2 > argCount) return RValue_makeUndefined();
+    DsList* list = dsListGet(ctx->runner, RValue_toInt32(args[0]));
+    if (list == nullptr) return RValue_makeUndefined();
+    bool ascending = RValue_toBool(args[1]);
+    int32_t n = (int32_t) arrlen(list->items);
+    for (int32_t i = 1; i < n; i++) {
+        RValue key = list->items[i];
+        int32_t j = i - 1;
+        while (j >= 0) {
+            int order = arraySortDefaultOrder(&list->items[j], &key);
+            if (!ascending) order = -order;
+            if (0 >= order) break;
+            list->items[j + 1] = list->items[j];
+            j--;
+        }
+        list->items[j + 1] = key;
+    }
+    return RValue_makeUndefined();
 }
 
 static RValue builtin_ds_list_replace(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
@@ -9208,6 +9356,11 @@ static RValue builtin_buffer_create(MAYBE_UNUSED VMContext* ctx, RValue* args, M
     return RValue_makeReal((GMLReal) id);
 }
 
+static RValue builtin_buffer_exists(MAYBE_UNUSED VMContext* ctx, RValue* args, int32_t argCount) {
+    if (1 > argCount) return RValue_makeBool(false);
+    return RValue_makeBool(gmlBufferGet(ctx->runner, RValue_toInt32(args[0])) != nullptr);
+}
+
 static RValue builtin_buffer_delete(MAYBE_UNUSED VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
     Runner* runner = ctx->runner;
     int32_t id = RValue_toInt32(args[0]);
@@ -10967,6 +11120,45 @@ static RValue builtin_draw_triangle_color(VMContext* ctx, RValue* args, MAYBE_UN
         }
         runner->renderer->vtable->drawTriangle(runner->renderer, x1, y1, x2, y2, x3, y3, col1, col2, col3, runner->renderer->drawAlpha, outline);
     }
+    return RValue_makeUndefined();
+}
+
+// draw_arrow(x1, y1, x2, y2, size): a line with a filled head at the second point. The head is
+// clamped to the line length, like the runner does, so a short arrow degenerates into just a head.
+static RValue builtin_draw_arrow(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (5 > argCount) return RValue_makeUndefined();
+    Runner* runner = ctx->runner;
+    Renderer* renderer = runner->renderer;
+    if (renderer == nullptr) return RValue_makeUndefined();
+
+    float x1 = (float) RValue_toReal(args[0]);
+    float y1 = (float) RValue_toReal(args[1]);
+    float x2 = (float) RValue_toReal(args[2]);
+    float y2 = (float) RValue_toReal(args[3]);
+    float size = (float) RValue_toReal(args[4]);
+    if (runner->applyOffsetForPrimitives) {
+        x1 += 1.0f; y1 += 1.0f;
+        x2 += 1.0f; y2 += 1.0f;
+    }
+
+    float dx = x2 - x1;
+    float dy = y2 - y1;
+    float length = sqrtf((dx * dx) + (dy * dy));
+    if (length <= 0.0f) return RValue_makeUndefined();
+    if (size > length) size = length;
+
+    float ux = dx / length;
+    float uy = dy / length;
+    float baseX = x2 - (ux * size);
+    float baseY = y2 - (uy * size);
+    float halfWidth = size * 0.5f;
+
+    renderer->vtable->drawLine(renderer, x1, y1, baseX, baseY, 1.0f, renderer->drawColor, renderer->drawAlpha);
+    renderer->vtable->drawTriangle(renderer, x2, y2,
+                                   baseX - (uy * halfWidth), baseY + (ux * halfWidth),
+                                   baseX + (uy * halfWidth), baseY - (ux * halfWidth),
+                                   renderer->drawColor, renderer->drawColor, renderer->drawColor,
+                                   renderer->drawAlpha, false);
     return RValue_makeUndefined();
 }
 
@@ -15109,6 +15301,15 @@ static RValue builtin_tile_get_index(MAYBE_UNUSED VMContext* ctx, RValue* args, 
     return RValue_makeReal((GMLReal) (RValue_toInt32(args[0]) & TILEINDEX_SHIFTEDMASK));
 }
 
+// tile_set_index(tiledata, index): replaces the cell index in a raw tile cell value, keeping the
+// mirror/flip/rotate bits. Returns the new value -- it does not touch the tilemap.
+static RValue builtin_tile_set_index(MAYBE_UNUSED VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    if (2 > argCount) return RValue_makeReal(0.0);
+    uint32_t cell = (uint32_t) RValue_toInt32(args[0]);
+    uint32_t index = (uint32_t) RValue_toInt32(args[1]) & TILEINDEX_SHIFTEDMASK;
+    return RValue_makeReal((GMLReal) ((cell & ~(uint32_t) TILEINDEX_SHIFTEDMASK) | index));
+}
+
 // tile_get_mirror(tiledata): returns whether the horizontal-mirror bit is set on a raw tile cell value.
 // (see GameMaker-HTML5 Function_Layers.js)
 static RValue builtin_tile_get_mirror(MAYBE_UNUSED VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
@@ -17695,6 +17896,8 @@ void VMBuiltins_registerAll(VMContext* ctx) {
 
     // Core output
     VM_registerBuiltin(ctx, "show_debug_message", builtin_show_debug_message);
+    VM_registerBuiltin(ctx, "show_message", builtin_show_message);
+    VM_registerBuiltin(ctx, "show_error", builtin_show_error);
 
     // String functions
     VM_registerBuiltin(ctx, "string_length", builtin_string_length);
@@ -17704,6 +17907,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "string_byte_length", builtin_string_byte_length);
     VM_registerBuiltin(ctx, "string", builtin_string);
     VM_registerBuiltin(ctx, "string_upper", builtin_string_upper);
+    VM_registerBuiltin(ctx, "string_trim_start", builtin_string_trim_start);
     VM_registerBuiltin(ctx, "string_lower", builtin_string_lower);
     VM_registerBuiltin(ctx, "string_copy", builtin_string_copy);
     VM_registerBuiltin(ctx, "string_pos", builtin_string_pos);
@@ -17755,6 +17959,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "power", builtin_power);
     VM_registerBuiltin(ctx, "sqrt", builtin_sqrt);
     VM_registerBuiltin(ctx, "log2", builtin_log2);
+    VM_registerBuiltin(ctx, "log10", builtin_log10);
     VM_registerBuiltin(ctx, "sqr", builtin_sqr);
     VM_registerBuiltin(ctx, "sin", builtin_sin);
     VM_registerBuiltin(ctx, "arccos", builtin_arccos);
@@ -17772,6 +17977,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "tan", builtin_tan);
     VM_registerBuiltin(ctx, "dot_product", builtin_dot_product);
     VM_registerBuiltin(ctx, "point_distance", builtin_point_distance);
+    VM_registerBuiltin(ctx, "point_distance_3d", builtin_point_distance_3d);
     VM_registerBuiltin(ctx, "point_in_rectangle", builtin_point_in_rectangle);
     VM_registerBuiltin(ctx, "point_in_circle", builtin_point_in_circle);
     VM_registerBuiltin(ctx, "point_direction", builtin_point_direction);
@@ -17808,6 +18014,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "irandom_range", builtin_irandom_range);
     VM_registerBuiltin(ctx, "choose", builtin_choose);
     VM_registerBuiltin(ctx, "randomize", builtin_randomize);
+    VM_registerBuiltin(ctx, "random_set_seed", builtin_random_set_seed);
     VM_registerBuiltin(ctx, "randomise", builtin_randomize);
 
     // Room
@@ -17887,6 +18094,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
 
     // OS
     VM_registerBuiltin(ctx, "os_get_language", builtin_os_get_language);
+    VM_registerBuiltin(ctx, "os_get_info", builtin_os_get_info);
     VM_registerBuiltin(ctx, "os_get_region", builtin_os_get_region);
     VM_registerBuiltin(ctx, "os_is_paused", builtin_os_is_paused);
 
@@ -17920,6 +18128,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "ds_map_find_value", builtin_ds_map_find_value);
     VM_registerBuiltin(ctx, "ds_map_exists", builtin_ds_map_exists);
     VM_registerBuiltin(ctx, "ds_map_find_first", builtin_ds_map_find_first);
+    VM_registerBuiltin(ctx, "ds_map_keys_to_array", builtin_ds_map_keys_to_array);
     VM_registerBuiltin(ctx, "ds_map_find_next", builtin_ds_map_find_next);
     VM_registerBuiltin(ctx, "ds_map_size", builtin_ds_map_size);
     VM_registerBuiltin(ctx, "ds_map_destroy", builtin_ds_map_destroy);
@@ -17939,6 +18148,8 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "ds_list_write", builtin_ds_list_write);
     VM_registerBuiltin(ctx, "ds_list_read", builtin_ds_list_read);
     VM_registerBuiltin(ctx, "ds_list_replace", builtin_ds_list_replace);
+    VM_registerBuiltin(ctx, "ds_list_set", builtin_ds_list_set);
+    VM_registerBuiltin(ctx, "ds_list_sort", builtin_ds_list_sort);
     VM_registerBuiltin(ctx, "ds_list_copy", builtin_ds_list_copy);
 
     // ds_grid
@@ -18239,6 +18450,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     // Buffer
     VM_registerBuiltin(ctx, "buffer_create", builtin_buffer_create);
     VM_registerBuiltin(ctx, "buffer_delete", builtin_buffer_delete);
+    VM_registerBuiltin(ctx, "buffer_exists", builtin_buffer_exists);
     VM_registerBuiltin(ctx, "buffer_write", builtin_buffer_write);
     VM_registerBuiltin(ctx, "buffer_read", builtin_buffer_read);
     VM_registerBuiltin(ctx, "buffer_seek", builtin_buffer_seek);
@@ -18334,6 +18546,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "draw_point_color", builtin_draw_point_color);
     VM_registerBuiltin(ctx, "draw_point_colour", builtin_draw_point_color);
     VM_registerBuiltin(ctx, "draw_line", builtin_draw_line);
+    VM_registerBuiltin(ctx, "draw_arrow", builtin_draw_arrow);
     VM_registerBuiltin(ctx, "draw_line_colour", builtin_draw_line_colour);
     VM_registerBuiltin(ctx, "draw_line_color", builtin_draw_line_colour); // alt-spelling (used in Undertale)
     VM_registerBuiltin(ctx, "draw_line_width", builtin_draw_line_width);
@@ -18678,6 +18891,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "tilemap_get_at_pixel", builtin_tilemap_get_at_pixel);
     VM_registerBuiltin(ctx, "tilemap_get_tileset", builtin_tilemap_get_tileset);
     VM_registerBuiltin(ctx, "tile_get_index", builtin_tile_get_index);
+    VM_registerBuiltin(ctx, "tile_set_index", builtin_tile_set_index);
     VM_registerBuiltin(ctx, "tile_get_mirror", builtin_tile_get_mirror);
     VM_registerBuiltin(ctx, "tile_get_flip", builtin_tile_get_flip);
     VM_registerBuiltin(ctx, "tile_get_rotate", builtin_tile_get_rotate);

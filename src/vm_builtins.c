@@ -17723,6 +17723,138 @@ static RValue jsonDecodeValue(VMContext* ctx, JsonValue* json) {
     }
 }
 
+// ===[ json_parse / json_stringify ]===
+//
+// Not aliases of json_decode/json_encode: that older pair speaks ds_maps and ds_lists, while this
+// one speaks the language's own structs and arrays. The shared part is the reader and writer
+// modules; the difference is entirely in what gets built from them.
+
+static RValue jsonValueToRValue(VMContext* ctx, const JsonValue* json) {
+    if (json == nullptr || JsonReader_isNull(json)) return RValue_makeUndefined();
+    if (JsonReader_isBool(json)) return RValue_makeBool(JsonReader_getBool(json));
+    if (JsonReader_isNumber(json)) return RValue_makeReal((GMLReal) JsonReader_getDouble(json));
+    if (JsonReader_isString(json)) {
+        const char* str = JsonReader_getString(json);
+        return RValue_makeOwnedString(safeStrdup(str != nullptr ? str : ""));
+    }
+    if (JsonReader_isArray(json)) {
+        int length = JsonReader_arrayLength(json);
+        GMLArray* array = GMLArray_create(ctx->dataWin->gen8.wadVersion, 0);
+        for (int i = 0; i < length; i++) {
+            GMLArray_growTo(array, i + 1);
+            *GMLArray_slot(array, i) = jsonValueToRValue(ctx, JsonReader_getArrayElement(json, i));
+        }
+        return RValue_makeArray(array);
+    }
+    if (JsonReader_isObject(json)) {
+        Instance* structInst = Runner_createStruct(ctx->runner);
+        int length = JsonReader_objectLength(json);
+        for (int i = 0; i < length; i++) {
+            const char* key = JsonReader_getJsonKeyByIndex(json, i);
+            if (key == nullptr) continue;
+            RValue value = jsonValueToRValue(ctx, JsonReader_getJsonValueByIndex(json, i));
+            VM_structSetAndFreeVal(ctx, structInst, key, value, -1);
+        }
+        return RValue_makeStructAndIncRef(structInst);
+    }
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_json_parse(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (1 > argCount || args[0].type != RVALUE_STRING) return RValue_makeUndefined();
+    JsonValue* json = JsonReader_parse(args[0].string);
+    if (json == nullptr) return RValue_makeUndefined();
+    RValue result = jsonValueToRValue(ctx, json);
+    JsonReader_free(json);
+    return result;
+}
+
+static void jsonWriteRValue(VMContext* ctx, JsonWriter* writer, const RValue* value, int32_t depth);
+
+static void jsonWriteStruct(VMContext* ctx, JsonWriter* writer, Instance* structInst, int32_t depth) {
+    JsonWriter_beginObject(writer);
+    if (structInst != nullptr) {
+        repeat(structInst->selfVars.capacity, i) {
+            IntRValueEntry* entry = &structInst->selfVars.entries[i];
+            if (entry->key == INT_RVALUE_HASHMAP_EMPTY_KEY) continue;
+            // Same accessor struct_get_names uses; the id-to-name table is not ours to index directly.
+            const char* name = VM_getVariableNameByVarId(ctx, entry->key);
+            if (name == nullptr) continue;
+            JsonWriter_key(writer, name);
+            jsonWriteRValue(ctx, writer, &entry->value, depth + 1);
+        }
+    }
+    JsonWriter_endObject(writer);
+}
+
+static void jsonWriteRValue(VMContext* ctx, JsonWriter* writer, const RValue* value, int32_t depth) {
+    // A struct that refers to itself would otherwise recurse until the stack runs out. GameMaker
+    // does not define what happens there either; stopping is the only answer that keeps the frame.
+    if (32 < depth) {
+        JsonWriter_null(writer);
+        return;
+    }
+    switch (value->type) {
+        case RVALUE_STRING:
+            JsonWriter_string(writer, value->string != nullptr ? value->string : "");
+            break;
+        case RVALUE_BOOL:
+            JsonWriter_bool(writer, value->int32 != 0);
+            break;
+        case RVALUE_UNDEFINED:
+            JsonWriter_null(writer);
+            break;
+        case RVALUE_ARRAY: {
+            JsonWriter_beginArray(writer);
+            int32_t length = GMLArray_length1D(value->array);
+            for (int32_t i = 0; i < length; i++) {
+                RValue element = GMLArray_get(value->array, i);
+                jsonWriteRValue(ctx, writer, &element, depth + 1);
+            }
+            JsonWriter_endArray(writer);
+            break;
+        }
+        case RVALUE_STRUCT:
+            jsonWriteStruct(ctx, writer, value->structInst, depth);
+            break;
+        default: {
+            GMLReal number = RValue_toReal(*value);
+            // Whole numbers go out without a decimal point, the way the runner writes them.
+            if (number == (GMLReal) (int64_t) number) JsonWriter_int(writer, (int64_t) number);
+            else JsonWriter_double(writer, (double) number);
+            break;
+        }
+    }
+}
+
+static RValue builtin_json_stringify(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (1 > argCount) return RValue_makeOwnedString(safeStrdup(""));
+    JsonWriter writer = JsonWriter_create();
+    jsonWriteRValue(ctx, &writer, &args[0], 0);
+    char* output = JsonWriter_copyOutput(&writer);
+    JsonWriter_free(&writer);
+    return RValue_makeOwnedString(output != nullptr ? output : safeStrdup(""));
+}
+
+// instanceof(value): the name of the constructor a struct was built with, or "struct" when it was
+// built by a plain literal and has no constructor to name.
+static RValue builtin_instanceof(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (1 > argCount || args[0].type != RVALUE_STRUCT || args[0].structInst == nullptr) {
+        return RValue_makeUndefined();
+    }
+    int32_t codeIndex = args[0].structInst->constructorCodeIndex;
+    if (0 > codeIndex || ctx->dataWin->code.count <= (uint32_t) codeIndex) {
+        return RValue_makeOwnedString(safeStrdup("struct"));
+    }
+    const char* name = ctx->dataWin->code.entries[codeIndex].name;
+    if (name == nullptr) return RValue_makeOwnedString(safeStrdup("struct"));
+    // Code entries are named gml_Script_<function>; the caller wants the function.
+    const char* prefix = "gml_Script_";
+    size_t prefixLen = strlen(prefix);
+    if (strncmp(name, prefix, prefixLen) == 0) name += prefixLen;
+    return RValue_makeOwnedString(safeStrdup(name));
+}
+
 static RValue builtin_json_decode(VMContext* ctx, RValue* args, int32_t argCount) {
     if (1 > argCount) {
         logWarn("[json_decode] Expected at least 1 argument\n");
@@ -20258,6 +20390,9 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "alarm_get", builtin_alarm_get);
     VM_registerBuiltin(ctx, "string_hash_to_newline", builtin_string_hash_to_newline);
     VM_registerBuiltin(ctx, "json_decode", builtin_json_decode);
+    VM_registerBuiltin(ctx, "json_parse", builtin_json_parse);
+    VM_registerBuiltin(ctx, "json_stringify", builtin_json_stringify);
+    VM_registerBuiltin(ctx, "instanceof", builtin_instanceof);
     VM_registerBuiltin(ctx, "json_encode", builtin_json_encode);
     VM_registerBuiltin(ctx, "font_add_sprite", builtin_font_add_sprite);
     VM_registerBuiltin(ctx, "font_add_sprite_ext", builtin_font_add_sprite_ext);

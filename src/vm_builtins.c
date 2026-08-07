@@ -2718,6 +2718,67 @@ static RValue builtin_arctan(MAYBE_UNUSED VMContext* ctx, RValue* args, int32_t 
     return RValue_makeReal(GMLReal_atan(y));
 }
 
+// arctan2(y, x): the argument order is y first, as in C, not x first.
+static RValue builtin_arctan2(MAYBE_UNUSED VMContext* ctx, RValue* args, int32_t argCount) {
+    if (2 > argCount) return RValue_makeReal(0.0);
+    return RValue_makeReal(GMLReal_atan2(RValue_toReal(args[0]), RValue_toReal(args[1])));
+}
+
+static RValue builtin_bool(MAYBE_UNUSED VMContext* ctx, RValue* args, int32_t argCount) {
+    if (1 > argCount) return RValue_makeBool(false);
+    return RValue_makeBool(RValue_toBool(args[0]));
+}
+
+// string_byte_at(str, pos): the raw byte, not the codepoint -- that is string_ord_at's job.
+static RValue builtin_string_byte_at(MAYBE_UNUSED VMContext* ctx, RValue* args, int32_t argCount) {
+    if (2 > argCount) return RValue_makeReal(0.0);
+    char* str = RValue_toString(args[0]);
+    int32_t pos = RValue_toInt32(args[1]) - 1;   // 1-based
+    int32_t len = (int32_t) strlen(str);
+    GMLReal result = (0 <= pos && pos < len) ? (GMLReal) (uint8_t) str[pos] : 0.0;
+    free(str);
+    return RValue_makeReal(result);
+}
+
+// rectangle_in_triangle(x1,y1,x2,y2, tx1,ty1,tx2,ty2,tx3,ty3):
+// 0 = outside, 1 = fully inside, 2 = partly. Decided by counting how many rectangle corners fall
+// in the triangle, plus an edge-crossing test so a triangle that cuts through the rectangle
+// without containing a corner still reports an overlap.
+static bool pointInTriangle(GMLReal px, GMLReal py, GMLReal ax, GMLReal ay, GMLReal bx, GMLReal by, GMLReal cx, GMLReal cy) {
+    GMLReal d1 = ((px - bx) * (ay - by)) - ((ax - bx) * (py - by));
+    GMLReal d2 = ((px - cx) * (by - cy)) - ((bx - cx) * (py - cy));
+    GMLReal d3 = ((px - ax) * (cy - ay)) - ((cx - ax) * (py - ay));
+    bool hasNeg = (d1 < 0) || (d2 < 0) || (d3 < 0);
+    bool hasPos = (d1 > 0) || (d2 > 0) || (d3 > 0);
+    return !(hasNeg && hasPos);
+}
+
+static RValue builtin_rectangle_in_triangle(MAYBE_UNUSED VMContext* ctx, RValue* args, int32_t argCount) {
+    if (10 > argCount) return RValue_makeReal(0.0);
+    GMLReal x1 = RValue_toReal(args[0]), y1 = RValue_toReal(args[1]);
+    GMLReal x2 = RValue_toReal(args[2]), y2 = RValue_toReal(args[3]);
+    GMLReal ax = RValue_toReal(args[4]), ay = RValue_toReal(args[5]);
+    GMLReal bx = RValue_toReal(args[6]), by = RValue_toReal(args[7]);
+    GMLReal cx = RValue_toReal(args[8]), cy = RValue_toReal(args[9]);
+    if (x1 > x2) { GMLReal t = x1; x1 = x2; x2 = t; }
+    if (y1 > y2) { GMLReal t = y1; y1 = y2; y2 = t; }
+
+    int32_t inside = 0;
+    inside += pointInTriangle(x1, y1, ax, ay, bx, by, cx, cy) ? 1 : 0;
+    inside += pointInTriangle(x2, y1, ax, ay, bx, by, cx, cy) ? 1 : 0;
+    inside += pointInTriangle(x1, y2, ax, ay, bx, by, cx, cy) ? 1 : 0;
+    inside += pointInTriangle(x2, y2, ax, ay, bx, by, cx, cy) ? 1 : 0;
+    if (inside == 4) return RValue_makeReal(1.0);
+    if (0 < inside) return RValue_makeReal(2.0);
+
+    // No corner inside: the triangle may still poke through, which shows up as one of its own
+    // vertices landing in the rectangle.
+    bool touches = (ax >= x1 && ax <= x2 && ay >= y1 && ay <= y2)
+                || (bx >= x1 && bx <= x2 && by >= y1 && by <= y2)
+                || (cx >= x1 && cx <= x2 && cy >= y1 && cy <= y2);
+    return RValue_makeReal(touches ? 2.0 : 0.0);
+}
+
 static RValue builtin_darctan(MAYBE_UNUSED VMContext* ctx, RValue* args, int32_t argCount) {
     if (1 > argCount) return RValue_makeReal(0.0);
     GMLReal y = RValue_toReal(args[0]);
@@ -3308,6 +3369,19 @@ static RValue builtin_random_set_seed(MAYBE_UNUSED VMContext* ctx, RValue* args,
 }
 
 // ===[ ROOM FUNCTIONS ]===
+
+// game_set_speed(value, type): gamespeed_fps = 0, gamespeed_microseconds = 1.
+static RValue builtin_game_set_speed(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (2 > argCount || ctx->runner->currentRoom == nullptr) return RValue_makeUndefined();
+    GMLReal value = RValue_toReal(args[0]);
+    if (RValue_toInt32(args[1]) == 1) {
+        if (0.0 >= value) return RValue_makeUndefined();
+        value = 1000000.0 / value;
+    }
+    if (0.0 >= value) return RValue_makeUndefined();
+    ctx->runner->currentRoom->speed = (int32_t) value;
+    return RValue_makeUndefined();
+}
 
 static RValue builtin_game_get_speed(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
     if (1 > argCount) return RValue_makeUndefined();
@@ -4732,6 +4806,12 @@ static RValue builtin_ds_map_find_next(VMContext* ctx, RValue* args, int32_t arg
     return RValue_makeOwnedString(safeStrdup((*mapPtr)[idx + 1].key));
 }
 
+static RValue builtin_ds_map_empty(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (1 > argCount) return RValue_makeBool(true);
+    DsMapEntry** mapPtr = dsMapGet(ctx->runner, RValue_toInt32(args[0]));
+    return RValue_makeBool(mapPtr == nullptr || shlen(*mapPtr) == 0);
+}
+
 static RValue builtin_ds_map_size(VMContext* ctx, RValue* args, int32_t argCount) {
     if (1 > argCount) return RValue_makeReal(0.0);
     Runner* runner = ctx->runner;
@@ -5375,6 +5455,55 @@ static RValue builtin_ds_grid_set(VMContext* ctx, MAYBE_UNUSED RValue* args, MAY
     RValue_free(slot);
     *slot = newValue;
     return RValue_makeUndefined();
+}
+
+static RValue builtin_ds_grid_clear(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (2 > argCount) return RValue_makeUndefined();
+    DsGrid* grid = dsGridGet(ctx->runner, RValue_toInt32(args[0]));
+    if (grid == nullptr) return RValue_makeUndefined();
+    int32_t cells = grid->width * grid->height;
+    for (int32_t i = 0; i < cells; i++) {
+        RValue_free(&grid->items[i]);
+        grid->items[i] = RValue_makeIndependent(args[1]);
+    }
+    return RValue_makeUndefined();
+}
+
+// ds_grid_value_x / ds_grid_value_y: the coordinates of the largest value in a rectangle.
+// Seeded from the first cell rather than a sentinel, for the reason spelled out at
+// ds_priority_find_min -- a NaN in the region would otherwise leave the answer at -1.
+static RValue dsGridValueCoord(VMContext* ctx, RValue* args, int32_t argCount, bool wantX) {
+    if (5 > argCount) return RValue_makeReal(-1.0);
+    DsGrid* grid = dsGridGet(ctx->runner, RValue_toInt32(args[0]));
+    if (grid == nullptr) return RValue_makeReal(-1.0);
+
+    int32_t x1 = RValue_toInt32(args[1]), y1 = RValue_toInt32(args[2]);
+    int32_t x2 = RValue_toInt32(args[3]), y2 = RValue_toInt32(args[4]);
+    if (x1 > x2) { int32_t t = x1; x1 = x2; x2 = t; }
+    if (y1 > y2) { int32_t t = y1; y1 = y2; y2 = t; }
+    if (0 > x1) x1 = 0;
+    if (0 > y1) y1 = 0;
+    if (x2 >= grid->width) x2 = grid->width - 1;
+    if (y2 >= grid->height) y2 = grid->height - 1;
+    if (x1 > x2 || y1 > y2) return RValue_makeReal(-1.0);
+
+    int32_t bestX = x1, bestY = y1;
+    GMLReal best = RValue_toReal(grid->items[x1 + (y1 * grid->width)]);
+    for (int32_t y = y1; y <= y2; y++) {
+        for (int32_t x = x1; x <= x2; x++) {
+            GMLReal value = RValue_toReal(grid->items[x + (y * grid->width)]);
+            if (value > best) { best = value; bestX = x; bestY = y; }
+        }
+    }
+    return RValue_makeReal((GMLReal) (wantX ? bestX : bestY));
+}
+
+static RValue builtin_ds_grid_value_x(VMContext* ctx, RValue* args, int32_t argCount) {
+    return dsGridValueCoord(ctx, args, argCount, true);
+}
+
+static RValue builtin_ds_grid_value_y(VMContext* ctx, RValue* args, int32_t argCount) {
+    return dsGridValueCoord(ctx, args, argCount, false);
 }
 
 static RValue builtin_ds_grid_get(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
@@ -8114,6 +8243,13 @@ static RValue builtin_ini_write_real(VMContext* ctx, RValue* args, int32_t argCo
     return RValue_makeUndefined();
 }
 
+static RValue builtin_ini_section_delete(VMContext* ctx, RValue* args, int32_t argCount) {
+    Runner* runner = ctx->runner;
+    if (1 > argCount || runner->currentIni == nullptr) return RValue_makeUndefined();
+    Ini_deleteSection(runner->currentIni, args[0].type == RVALUE_STRING ? args[0].string : "");
+    return RValue_makeUndefined();
+}
+
 static RValue builtin_ini_section_exists(VMContext* ctx, RValue* args, int32_t argCount) {
     Runner* runner = ctx->runner;
     if (1 > argCount || runner->currentIni == nullptr) return RValue_makeBool(false);
@@ -9084,6 +9220,34 @@ static RValue builtin_instance_find(VMContext* ctx, RValue* args, int32_t argCou
     return RValue_makeReal((GMLReal) resultId);
 }
 
+// instance_furthest: the mirror of instance_nearest, sharing its shape so the two stay comparable.
+static RValue builtin_instance_furthest(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (3 > argCount) return RValue_makeReal(INSTANCE_NOONE);
+    Runner* runner = ctx->runner;
+    GMLReal x = RValue_toReal(args[0]);
+    GMLReal y = RValue_toReal(args[1]);
+    GMLReal bestDistSq = 0.0;
+    int32_t objectIndex = RValue_toInt32(args[2]);
+    int32_t resultId = INSTANCE_NOONE;
+    int32_t snapBase = Runner_pushInstancesOfObject(runner, objectIndex);
+    int32_t snapEnd  = (int32_t) arrlen(runner->instanceSnapshots);
+    for (int32_t i = snapBase; snapEnd > i; i++) {
+        Instance* inst = runner->instanceSnapshots[i];
+        if (!inst->active) continue;
+
+        GMLReal dx = inst->x - x;
+        GMLReal dy = inst->y - y;
+        GMLReal distSq = dx * dx + dy * dy;
+
+        if (resultId == INSTANCE_NOONE || distSq > bestDistSq) {
+            resultId = inst->instanceId;
+            bestDistSq = distSq;
+        }
+    }
+    Runner_popInstanceSnapshot(runner, snapBase);
+    return RValue_makeReal((GMLReal) resultId);
+}
+
 static RValue builtin_instance_nearest(VMContext* ctx, RValue* args, int32_t argCount) {
     if (3 > argCount) return RValue_makeReal(INSTANCE_NOONE);
     Runner* runner = ctx->runner;
@@ -9935,6 +10099,66 @@ static RValue builtin_buffer_delete(MAYBE_UNUSED VMContext* ctx, RValue* args, M
         buf->data = nullptr;
         buf->isValid = false;
     }
+    return RValue_makeUndefined();
+}
+
+// buffer_resize(buffer, size). A grow buffer resizes itself on write, but the game may ask for the
+// space up front, and a fixed one has no other way to change size.
+static RValue builtin_buffer_resize(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (2 > argCount) return RValue_makeBool(false);
+    GmlBuffer* buf = gmlBufferGet(ctx->runner, RValue_toInt32(args[0]));
+    int32_t size = RValue_toInt32(args[1]);
+    if (buf == nullptr || 0 > size) return RValue_makeBool(false);
+
+    uint8_t* data = (uint8_t*) safeRealloc(buf->data, (size_t) size);
+    // Fresh bytes are zeroed: a buffer that grows into uninitialised heap would leak whatever was
+    // there into a save file the next time the game wrote it out.
+    if (size > buf->size && data != nullptr) memset(data + buf->size, 0, (size_t) (size - buf->size));
+    buf->data = data;
+    buf->size = size;
+    if (buf->position > size) buf->position = size;
+    if (buf->usedSize > size) buf->usedSize = size;
+    return RValue_makeBool(true);
+}
+
+// buffer_fill(buffer, offset, type, value, size): writes the same value repeatedly. Only the
+// byte-wide types are honoured exactly; wider ones are filled byte by byte from the low byte, which
+// is what the callers use it for (clearing a region).
+static RValue builtin_buffer_fill(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (5 > argCount) return RValue_makeUndefined();
+    GmlBuffer* buf = gmlBufferGet(ctx->runner, RValue_toInt32(args[0]));
+    int32_t offset = RValue_toInt32(args[1]);
+    uint8_t value = (uint8_t) RValue_toInt32(args[3]);
+    int32_t size = RValue_toInt32(args[4]);
+    if (buf == nullptr || 0 > offset || 0 >= size) return RValue_makeUndefined();
+
+    gmlBufferEnsureSize(buf, offset + size);
+    if (offset + size > buf->size) size = buf->size - offset;
+    if (0 < size) {
+        memset(buf->data + offset, value, (size_t) size);
+        if (buf->type == GML_BUFFER_GROW && offset + size > buf->usedSize) buf->usedSize = offset + size;
+    }
+    return RValue_makeUndefined();
+}
+
+// buffer_copy(src, srcOffset, size, dest, destOffset)
+static RValue builtin_buffer_copy(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (5 > argCount) return RValue_makeUndefined();
+    Runner* runner = ctx->runner;
+    GmlBuffer* src = gmlBufferGet(runner, RValue_toInt32(args[0]));
+    int32_t srcOffset = RValue_toInt32(args[1]);
+    int32_t size = RValue_toInt32(args[2]);
+    GmlBuffer* dest = gmlBufferGet(runner, RValue_toInt32(args[3]));
+    int32_t destOffset = RValue_toInt32(args[4]);
+    if (src == nullptr || dest == nullptr || 0 > srcOffset || 0 > destOffset || 0 >= size) return RValue_makeUndefined();
+    if (srcOffset + size > src->size) return RValue_makeUndefined();
+
+    gmlBufferEnsureSize(dest, destOffset + size);
+    if (destOffset + size > dest->size) return RValue_makeUndefined();
+
+    // memmove, not memcpy: copying inside one buffer with overlapping ranges is legal here.
+    memmove(dest->data + destOffset, src->data + srcOffset, (size_t) size);
+    if (dest->type == GML_BUFFER_GROW && destOffset + size > dest->usedSize) dest->usedSize = destOffset + size;
     return RValue_makeUndefined();
 }
 
@@ -18810,6 +19034,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "string_pos", builtin_string_pos);
     VM_registerBuiltin(ctx, "string_char_at", builtin_string_char_at);
     VM_registerBuiltin(ctx, "string_ord_at", builtin_string_ord_at);
+    VM_registerBuiltin(ctx, "string_byte_at", builtin_string_byte_at);
     VM_registerBuiltin(ctx, "string_split", builtin_string_split);
     VM_registerBuiltin(ctx, "string_delete", builtin_string_delete);
     VM_registerBuiltin(ctx, "string_insert", builtin_string_insert);
@@ -18862,6 +19087,9 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "arccos", builtin_arccos);
     VM_registerBuiltin(ctx, "arcsin", builtin_arcsin);
     VM_registerBuiltin(ctx, "arctan", builtin_arctan);
+    VM_registerBuiltin(ctx, "arctan2", builtin_arctan2);
+    VM_registerBuiltin(ctx, "bool", builtin_bool);
+    VM_registerBuiltin(ctx, "rectangle_in_triangle", builtin_rectangle_in_triangle);
     VM_registerBuiltin(ctx, "cos", builtin_cos);
     VM_registerBuiltin(ctx, "dsin", builtin_dsin);
     VM_registerBuiltin(ctx, "dcos", builtin_dcos);
@@ -18917,6 +19145,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
 
     // Room
     VM_registerBuiltin(ctx, "game_get_speed", builtin_game_get_speed);
+    VM_registerBuiltin(ctx, "game_set_speed", builtin_game_set_speed);
     VM_registerBuiltin(ctx, "room_exists", builtin_room_exists);
     VM_registerBuiltin(ctx, "room_get_name", builtin_room_get_name);
     VM_registerBuiltin(ctx, "room_get_info", builtin_room_get_info);
@@ -19030,6 +19259,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "ds_map_keys_to_array", builtin_ds_map_keys_to_array);
     VM_registerBuiltin(ctx, "ds_map_find_next", builtin_ds_map_find_next);
     VM_registerBuiltin(ctx, "ds_map_size", builtin_ds_map_size);
+    VM_registerBuiltin(ctx, "ds_map_empty", builtin_ds_map_empty);
     VM_registerBuiltin(ctx, "ds_map_destroy", builtin_ds_map_destroy);
 
     // ds_list
@@ -19058,6 +19288,9 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "ds_grid_height", builtin_ds_grid_height);
     VM_registerBuiltin(ctx, "ds_grid_set", builtin_ds_grid_set);
     VM_registerBuiltin(ctx, "ds_grid_get", builtin_ds_grid_get);
+    VM_registerBuiltin(ctx, "ds_grid_clear", builtin_ds_grid_clear);
+    VM_registerBuiltin(ctx, "ds_grid_value_x", builtin_ds_grid_value_x);
+    VM_registerBuiltin(ctx, "ds_grid_value_y", builtin_ds_grid_value_y);
     VM_registerBuiltin(ctx, "ds_grid_add", builtin_ds_grid_add);
     VM_registerBuiltin(ctx, "ds_grid_resize", builtin_ds_grid_resize);
 
@@ -19243,6 +19476,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "ini_read_string", builtin_ini_read_string);
     VM_registerBuiltin(ctx, "ini_read_real", builtin_ini_read_real);
     VM_registerBuiltin(ctx, "ini_section_exists", builtin_ini_section_exists);
+    VM_registerBuiltin(ctx, "ini_section_delete", builtin_ini_section_delete);
 
     // Directory
     VM_registerBuiltin(ctx, "directory_exists", builtin_directory_exists);
@@ -19334,6 +19568,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "instance_number", builtin_instance_number);
     VM_registerBuiltin(ctx, "instance_find", builtin_instance_find);
     VM_registerBuiltin(ctx, "instance_nearest", builtin_instance_nearest);
+    VM_registerBuiltin(ctx, "instance_furthest", builtin_instance_furthest);
     VM_registerBuiltin(ctx, "instance_destroy", builtin_instance_destroy);
     if(!isGMS2) {
         VM_registerBuiltin(ctx, "instance_create", builtin_instance_create);
@@ -19386,6 +19621,9 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "buffer_delete", builtin_buffer_delete);
     VM_registerBuiltin(ctx, "buffer_exists", builtin_buffer_exists);
     VM_registerBuiltin(ctx, "buffer_write", builtin_buffer_write);
+    VM_registerBuiltin(ctx, "buffer_copy", builtin_buffer_copy);
+    VM_registerBuiltin(ctx, "buffer_fill", builtin_buffer_fill);
+    VM_registerBuiltin(ctx, "buffer_resize", builtin_buffer_resize);
     VM_registerBuiltin(ctx, "buffer_read", builtin_buffer_read);
     VM_registerBuiltin(ctx, "buffer_seek", builtin_buffer_seek);
     VM_registerBuiltin(ctx, "buffer_tell", builtin_buffer_tell);

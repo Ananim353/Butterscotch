@@ -4335,6 +4335,22 @@ static RValue builtin_xboxone_show_account_picker(MAYBE_UNUSED VMContext* ctx, R
     return RValue_makeReal((GMLReal) asyncId);
 }
 
+// audio_get_recorder_count(): we have no capture device. This is not a placeholder -- 0 is the
+// correct answer, and games branch on it: DELTARUNE Chapter 4 clamps global.microphone to 0 when
+// the count is not positive and offers Mike's keyboard route instead. Returning undefined (the old
+// behaviour of an unregistered function) skips that clamp and leaves the game believing a
+// microphone exists.
+STUB_RETURN_ZERO(audio_get_recorder_count)
+STUB_RETURN_UNDEFINED(audio_get_recorder_info)
+
+// surface_depth_disable(disable): asks the runner not to attach a depth buffer to surfaces created
+// from here on. Ours never have one, so honouring the request is a no-op rather than a gap.
+STUB_RETURN_UNDEFINED(surface_depth_disable)
+
+// Borderless fullscreen is a desktop window mode we don't offer; sits with window_set_fullscreen,
+// which is stubbed for the same reason. DELTARUNE calls it at startup on every non-console build.
+STUB_RETURN_UNDEFINED(window_enable_borderless_fullscreen)
+
 STUB_RETURN_TRUE(xboxone_user_is_signed_in)
 STUB_RETURN_FALSE(xboxone_is_suspending)
 STUB_RETURN_FALSE(xboxone_is_constrained)
@@ -12518,6 +12534,97 @@ static RValue builtin_rectangle_in_rectangle(MAYBE_UNUSED VMContext* ctx, RValue
 }
 
 // collision_rectangle(x1, y1, x2, y2, obj, prec, notme)
+// Does the ellipse inscribed in (x1,y1)-(x2,y2) reach the axis-aligned box? Scaling the offset by
+// the radii turns the ellipse into a unit circle, so the nearest box point decides it.
+static bool ellipseOverlapsBox(GMLReal cx, GMLReal cy, GMLReal rx, GMLReal ry,
+                               GMLReal left, GMLReal top, GMLReal right, GMLReal bottom) {
+    if (0 >= rx || 0 >= ry) return false;
+    GMLReal nearestX = cx < left ? left : (cx > right ? right : cx);
+    GMLReal nearestY = cy < top ? top : (cy > bottom ? bottom : cy);
+    GMLReal dx = (nearestX - cx) / rx;
+    GMLReal dy = (nearestY - cy) / ry;
+    return (dx * dx + dy * dy) <= 1.0;
+}
+
+// collision_ellipse(x1, y1, x2, y2, obj, prec, notme): same contract as collision_rectangle, but
+// the shape is the ellipse inscribed in the rectangle.
+static RValue builtin_collision_ellipse(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (7 > argCount) return RValue_makeReal((GMLReal) INSTANCE_NOONE);
+
+    Runner* runner = ctx->runner;
+    GMLReal x1 = RValue_toReal(args[0]);
+    GMLReal y1 = RValue_toReal(args[1]);
+    GMLReal x2 = RValue_toReal(args[2]);
+    GMLReal y2 = RValue_toReal(args[3]);
+    int32_t targetObjIndex = VM_resolveInstanceTarget(ctx, RValue_toInt32(args[4]));
+    int32_t prec = RValue_toInt32(args[5]);
+    int32_t notme = RValue_toInt32(args[6]);
+
+    if (targetObjIndex == INSTANCE_NOONE) return RValue_makeReal((GMLReal) INSTANCE_NOONE);
+    if (runner->collisionCompatibilityMode) {
+        x1 = compatRoundCoord(x1); y1 = compatRoundCoord(y1);
+        x2 = compatRoundCoord(x2); y2 = compatRoundCoord(y2);
+    }
+    if (x1 > x2) { GMLReal tmp = x1; x1 = x2; x2 = tmp; }
+    if (y1 > y2) { GMLReal tmp = y1; y1 = y2; y2 = tmp; }
+
+    GMLReal cx = (x1 + x2) * 0.5;
+    GMLReal cy = (y1 + y2) * 0.5;
+    GMLReal rx = (x2 - x1) * 0.5;
+    GMLReal ry = (y2 - y1) * 0.5;
+
+    Instance* self = ctx->currentInstance;
+    int32_t resultId = INSTANCE_NOONE;
+    int32_t snapBase = Runner_pushInstancesForTarget(runner, targetObjIndex);
+    int32_t snapEnd  = (int32_t) arrlen(runner->instanceSnapshots);
+    for (int32_t snapIdx = snapBase; snapEnd > snapIdx; snapIdx++) {
+        Instance* inst = runner->instanceSnapshots[snapIdx];
+        if (!inst->active) continue;
+        if (notme && inst == self) continue;
+
+        // Cheap reject first: the bounding rect has to touch at all before the ellipse can.
+        if (!Collision_rectOverlapsInstance(runner, inst, x1, y1, x2, y2)) continue;
+
+        InstanceBBox bbox = Collision_computeBBox(runner, inst);
+        if (!ellipseOverlapsBox(cx, cy, rx, ry, bbox.left, bbox.top, bbox.right, bbox.bottom)) continue;
+
+        if (prec != 0) {
+            Sprite* spr = Collision_getSprite(ctx->dataWin, inst);
+            if (Collision_hasFrameMasks(spr)) {
+                GMLReal iLeft   = GMLReal_fmax(x1, bbox.left);
+                GMLReal iRight  = GMLReal_fmin(x2, bbox.right);
+                GMLReal iTop    = GMLReal_fmax(y1, bbox.top);
+                GMLReal iBottom = GMLReal_fmin(y2, bbox.bottom);
+
+                bool found = false;
+                int32_t startX = (int32_t) GMLReal_floor(iLeft);
+                int32_t endX   = (int32_t) GMLReal_ceil(iRight);
+                int32_t startY = (int32_t) GMLReal_floor(iTop);
+                int32_t endY   = (int32_t) GMLReal_ceil(iBottom);
+
+                for (int32_t py = startY; endY > py && !found; py++) {
+                    for (int32_t px = startX; endX > px && !found; px++) {
+                        GMLReal wx = (GMLReal) px + 0.5;
+                        GMLReal wy = (GMLReal) py + 0.5;
+                        // Only pixels inside the ellipse count, not the whole overlap rect.
+                        GMLReal dx = (wx - cx) / rx;
+                        GMLReal dy = (wy - cy) / ry;
+                        if ((dx * dx + dy * dy) > 1.0) continue;
+                        if (Collision_pointInInstance(spr, inst, wx, wy)) found = true;
+                    }
+                }
+                if (!found) continue;
+            }
+        }
+
+        resultId = inst->instanceId;
+        break;
+    }
+    Runner_popInstanceSnapshot(runner, snapBase);
+
+    return RValue_makeReal((GMLReal) resultId);
+}
+
 static RValue builtin_collision_rectangle(VMContext* ctx, RValue* args, int32_t argCount) {
     if (7 > argCount) return RValue_makeReal((GMLReal) INSTANCE_NOONE);
 
@@ -17126,8 +17233,15 @@ static RValue builtin_gpu_get_blendenable(VMContext* ctx, RValue* args, int32_t 
 
 static RValue builtin_gpu_set_alphatestenable(VMContext* ctx, RValue* args, int32_t argCount) {
     bool enable = RValue_toBool(args[0]);
+    ctx->runner->renderer->alphaTestEnabled = enable;
     ctx->runner->renderer->vtable->gpuSetAlphaTestEnable(ctx->runner->renderer, enable);
     return RValue_makeUndefined();
+}
+
+// The state is mirrored on the renderer rather than read back from the backend: only some of them
+// can report it, and GML uses this purely to save and restore around its own drawing.
+static RValue builtin_gpu_get_alphatestenable(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    return RValue_makeBool(ctx->runner->renderer->alphaTestEnabled);
 }
 
 static RValue builtin_gpu_set_alphatestref(VMContext* ctx, RValue* args, int32_t argCount) {
@@ -18248,6 +18362,8 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "audio_master_gain", builtin_audio_master_gain);
     VM_registerBuiltin(ctx, "audio_set_master_gain", builtin_audio_set_master_gain);
     VM_registerBuiltin(ctx, "audio_group_load", builtin_audio_group_load);
+    VM_registerBuiltin(ctx, "audio_get_recorder_count", builtin_audio_get_recorder_count);
+    VM_registerBuiltin(ctx, "audio_get_recorder_info", builtin_audio_get_recorder_info);
     VM_registerBuiltin(ctx, "audio_group_is_loaded", builtin_audio_group_is_loaded);
     if (!isGMS2) {
         VM_registerBuiltin(ctx, "audio_play_music", builtin_audio_play_music);
@@ -18379,6 +18495,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     // Window
     VM_registerBuiltin(ctx, "window_get_fullscreen", builtin_window_get_fullscreen);
     VM_registerBuiltin(ctx, "window_set_fullscreen", builtin_window_set_fullscreen);
+    VM_registerBuiltin(ctx, "window_enable_borderless_fullscreen", builtin_window_enable_borderless_fullscreen);
     VM_registerBuiltin(ctx, "window_set_caption", builtin_window_set_caption);
     VM_registerBuiltin(ctx, "window_get_caption", builtin_window_get_caption);
     VM_registerBuiltin(ctx, "window_get_width", builtin_window_get_width);
@@ -18599,6 +18716,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "surface_get_width", builtin_surface_get_width);
     VM_registerBuiltin(ctx, "surface_get_height", builtin_surface_get_height);
     VM_registerBuiltin(ctx, "surface_get_texture", builtin_surface_get_texture);
+    VM_registerBuiltin(ctx, "surface_depth_disable", builtin_surface_depth_disable);
     VM_registerBuiltin(ctx, "surface_resize", builtin_surface_resize);
     VM_registerBuiltin(ctx, "surface_copy", builtin_surface_copy);
     VM_registerBuiltin(ctx, "surface_copy_part", builtin_surface_copy_part);
@@ -18664,6 +18782,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     // Collision
     VM_registerBuiltin(ctx, "place_meeting", builtin_place_meeting);
     VM_registerBuiltin(ctx, "collision_rectangle", builtin_collision_rectangle);
+    VM_registerBuiltin(ctx, "collision_ellipse", builtin_collision_ellipse);
     VM_registerBuiltin(ctx, "rectangle_in_rectangle", builtin_rectangle_in_rectangle);
     VM_registerBuiltin(ctx, "collision_line", builtin_collision_line);
     VM_registerBuiltin(ctx, "collision_point", builtin_collision_point);
@@ -19096,6 +19215,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx,"gpu_set_blendenable", builtin_gpu_set_blendenable);
     VM_registerBuiltin(ctx,"gpu_get_blendenable", builtin_gpu_get_blendenable);
     VM_registerBuiltin(ctx,"gpu_set_alphatestenable", builtin_gpu_set_alphatestenable);
+    VM_registerBuiltin(ctx, "gpu_get_alphatestenable", builtin_gpu_get_alphatestenable);
     VM_registerBuiltin(ctx,"gpu_set_alphatestref", builtin_gpu_set_alphatestref);
     VM_registerBuiltin(ctx,"gpu_set_colorwriteenable", builtin_gpu_set_colorwriteenable);
     VM_registerBuiltin(ctx,"gpu_set_colourwriteenable", builtin_gpu_set_colorwriteenable);

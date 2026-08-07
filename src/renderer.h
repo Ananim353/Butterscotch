@@ -198,6 +198,7 @@ struct Renderer {
     int32_t drawHalign;  // 0=left, 1=center, 2=right
     int32_t drawValign;  // 0=top, 1=middle, 2=bottom
     int32_t circlePrecision; // segments used by draw_circle/draw_ellipse, clamped to [4, 64] and rounded down to multiple of 4. Default 24.
+    bool alphaTestEnabled;   // mirrors the last gpu_set_alphatestenable, so gpu_get_alphatestenable can answer
     //It's The Simplest Way I Found To Restore Previous Thingies For Rendering SORRY
     Matrix4f previousViewMatrix; //when you go fix the Legacy OpenGL renderer, please remove this, as we don't need this anymore I hope
     int32_t CPortX;

@@ -44,15 +44,15 @@ void BsDiag_traceHot(const char* fmt, int a, int b);
 #define BFT_MARK(tag) BsDiag_traceHot(tag, 0, 0)
 
 // TEMP SAVE-PROFILE: write_real still measures ~33us/call after the no-malloc
-// formatting fix вЂ” split its body (format vs append vs rest) to find the real cost.
+// formatting fix — split its body (format vs append vs rest) to find the real cost.
 // Dumped+reset by the PERF window in psp/main.c.
 #include <pspthreadman.h>
 unsigned int g_ftwCalls, g_ftwTotalUs, g_ftwFmtUs, g_ftwAppUs, g_ftwNonNumeric;
 
-// TEMP COLPROF: place_meeting measured ~590us/call in battle defense вЂ” split it
+// TEMP COLPROF: place_meeting measured ~590us/call in battle defense — split it
 // between the grid sync, the cell walk (candidates/bbox computes) and the precise
 // pixel scan (g_colPixScans/g_colPixTested live in runner.c, bumped by collision.h).
-// g_colPreciseObj: objectIndex of the first mask-bearing party seen this window вЂ”
+// g_colPreciseObj: objectIndex of the first mask-bearing party seen this window —
 // names WHO forces the pixel scans. Dumped+reset by the PERF window in psp/main.c.
 unsigned int g_colCalls, g_colTotalUs, g_colSyncUs, g_colCand, g_colBBox;
 int g_colPreciseObj = -1;
@@ -2437,7 +2437,7 @@ static RValue builtin_chr(MAYBE_UNUSED VMContext* ctx, RValue* args, int32_t arg
 
 static RValue builtin_string_pos(MAYBE_UNUSED VMContext* ctx, RValue* args, int32_t argCount) {
     if (2 > argCount) return RValue_makeReal(0.0);
-    // Fast path: both operands already strings вЂ” search the borrowed pointers directly.
+    // Fast path: both operands already strings — search the borrowed pointers directly.
     // The generic path malloc-copies BOTH strings per call; the chase controller calls
     // this ~300 times per frame on layer names (13us/call, mostly allocator traffic).
     if (args[0].type == RVALUE_STRING && args[1].type == RVALUE_STRING
@@ -8063,7 +8063,7 @@ static RValue builtin_ini_open(VMContext* ctx, RValue* args, int32_t argCount) {
     runner->currentIniPath = safeStrdup(path);
 
 #ifdef PLATFORM_PSP
-    // TEMP diag: the boot menu saw ini_open at ~200ms/call вЂ” split read vs parse.
+    // TEMP diag: the boot menu saw ini_open at ~200ms/call — split read vs parse.
     extern void BsDiag_trace(const char* fmt, int a, int b);
     extern long long sceKernelGetSystemTimeWide(void);
     long long iniT0 = sceKernelGetSystemTimeWide();
@@ -8139,7 +8139,7 @@ static RValue builtin_ini_close(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE
     // Serialize the current contents.
     char* serialized = Ini_serialize(runner->currentIni, INI_SERIALIZE_DEFAULT_INITIAL_CAPACITY);
 
-    // Write back to disk only for file-backed INIs (ini_open) вЂ” and only when the
+    // Write back to disk only for file-backed INIs (ini_open) — and only when the
     // content actually differs from what the disk already holds (the game "writes"
     // its config on every save, almost always unchanged).
     // currentIniReadFailed: the file is on disk but ini_open could not read it, so what is in
@@ -8304,7 +8304,7 @@ static RValue builtin_directory_destroy(VMContext* ctx, RValue* args, int32_t ar
 // Appends bytes to a write-mode text file's buffer in amortized O(1): tracks length and
 // capacity and grows the buffer geometrically, instead of strlen()+realloc on every call.
 // The old code did strlen(writeBuffer) + realloc per line, making a save of a ~20KB /
-// 10000-line DELTARUNE file O(n^2) вЂ” several seconds on the PSP's 333MHz CPU.
+// 10000-line DELTARUNE file O(n^2) — several seconds on the PSP's 333MHz CPU.
 // NOT static: the native scr_saveprocess fast-path (native_fastpath.c) appends
 // its ~20k save lines directly, skipping the per-line builtin call overhead.
 void fileTextAppend(OpenTextFile* file, const char* data, size_t addLen) {
@@ -8322,7 +8322,7 @@ void fileTextAppend(OpenTextFile* file, const char* data, size_t addLen) {
 
 #ifdef PLATFORM_PSP
 // The save file is read via ~10000 file_text_* calls; tracing each one made loading
-// take minutes (two ms0 writes per call). Log every 256th call with its file position вЂ”
+// take minutes (two ms0 writes per call). Log every 256th call with its file position —
 // the last logged (n,pos) brackets the death within a 256-call window.
 static int g_ftCalls = 0;
 static void ftMarkThrottled(Runner* runner, int32_t handle) {
@@ -10978,7 +10978,7 @@ static RValue builtin_draw_sprite(VMContext* ctx, RValue* args, MAYBE_UNUSED int
     return RValue_makeUndefined();
 }
 
-// TEMP В§2.118: non-zero while a STRUCT (a particle) is drawing, so the PSP backend can report
+// TEMP §2.118: non-zero while a STRUCT (a particle) is drawing, so the PSP backend can report
 // what happened to its quad. Lives here rather than in psp_renderer.c because the desktop and
 // PS2/PS3 targets link vm_builtins.c but not the PSP backend.
 int g_bsStructDraw = 0;
@@ -11003,14 +11003,14 @@ static RValue builtin_draw_sprite_ext(VMContext* ctx, RValue* args, MAYBE_UNUSED
         subimg = (int32_t) ctx->currentInstance->imageIndex;
     }
 
-    // TEMP В§2.118: a sprite drawn from inside a STRUCT context is, in chapter 5, always a
-    // particle вЂ” obj_petal_burst's whole Draw is "with (particle_data[i]) draw_sprite_ext(...)".
+    // TEMP §2.118: a sprite drawn from inside a STRUCT context is, in chapter 5, always a
+    // particle — obj_petal_burst's whole Draw is "with (particle_data[i]) draw_sprite_ext(...)".
     // with(struct) now runs (confirmed on hardware) and the event costs up to 9ms a frame, yet
     // no petal appears, so the argument values themselves are the thing left unmeasured. Three
     // lines, then silence.
     // One line per DISTINCT sprite, not per call: the first probe spent all three of its lines in
     // the overworld on bush leaves (spr_bush_leaf_blue) and never reached the battle. Distinct
-    // sprites keep one line in reserve for whatever the fight actually draws вЂ” and a particle
+    // sprites keep one line in reserve for whatever the fight actually draws — and a particle
     // still carrying the constructor's default (spr_pxwhite, a 1x1 white pixel) would name itself.
     if (ctx->currentInstance != nullptr
         && ctx->currentInstance->objectIndex == STRUCT_OBJECT_INDEX) {
@@ -11046,7 +11046,7 @@ static RValue builtin_draw_sprite_ext(VMContext* ctx, RValue* args, MAYBE_UNUSED
             int camY = cam0 != nullptr ? (int) cam0->viewY : -1;
             // SCALE, the one argument never measured. Sprite, subimage, alpha, blend colour,
             // position and camera have all been checked correct on hardware, and the particles
-            // sit squarely inside the view вЂ” so a zero (or undefined-turned-zero) image_xscale
+            // sit squarely inside the view — so a zero (or undefined-turned-zero) image_xscale
             // is what a quad that costs time and covers no pixels looks like. x100 to keep the
             // fractional part visible in an integer trace.
             snprintf(dl, sizeof(dl), "structdraw %s spr=%d x=%d y=%d xs=%d a=%d cam=%d",
@@ -11057,7 +11057,7 @@ static RValue builtin_draw_sprite_ext(VMContext* ctx, RValue* args, MAYBE_UNUSED
         }
     }
 
-    // TEMP В§2.118: mark the call as coming from a struct so the PSP backend can report what
+    // TEMP §2.118: mark the call as coming from a struct so the PSP backend can report what
     // happened to the quad. Every ARGUMENT is now measured correct on hardware (sprite, subimage,
     // position inside the view, scale 2.0, alpha 1.0, white) and the petals are still invisible,
     // so the remaining unknown is downstream: tpag resolution, texture load, cull, screen rect.
@@ -11353,7 +11353,7 @@ static RValue builtin_draw_clear_alpha(VMContext* ctx, RValue* args, MAYBE_UNUSE
 // GM2 games call FMOD audio, particles, Steam, windowing helpers we don't have. Left
 // unresolved they return undefined, which STALLS game logic (Pizza Tower's intro cutscene
 // waits forever on fmod_event_instance_is_playing). These return sensible defaults so logic
-// progresses вЂ” the game just runs mute / without particles. Registered near the tile block.
+// progresses — the game just runs mute / without particles. Registered near the tile block.
 static RValue builtin_pt_stub_void(MAYBE_UNUSED VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
     return RValue_makeUndefined();
 }
@@ -11475,7 +11475,7 @@ static RValue builtin_draw_set_valign(VMContext* ctx, RValue* args, MAYBE_UNUSED
 
 // Borrow fast path for the draw_text* family: a STRING argument's pointer goes to
 // the renderer directly (the draw path never stores it past the call). The battle
-// writer draws one draw_text_color PER CHARACTER вЂ” 63/frame at a full textbox вЂ”
+// writer draws one draw_text_color PER CHARACTER — 63/frame at a full textbox —
 // and the strdup+free pair per call was most of its measured ~50us. Non-string
 // values still take the formatting path; *owned is what the caller must free.
 static inline const char* drawTextBorrowArg(RValue v, char** owned) {
@@ -12451,7 +12451,7 @@ static RValue builtin_surface_create(VMContext* ctx, RValue* args, MAYBE_UNUSED 
     Runner* runner = ctx->runner;
     if (runner->renderer != nullptr) {
         // Name the ASKER. The renderer only ever saw a size, so a pool that ran dry could say
-        // "DENIED req=343025" and nothing about whose effect just died вЂ” and on PSP the pool
+        // "DENIED req=343025" and nothing about whose effect just died — and on PSP the pool
         // does run dry (a battle filled 983040 bytes with eleven surfaces and then refused
         // twenty-eight more, one of which was the TP bar at 8KB). This line sits immediately
         // before the renderer's own, so the two read as one record.
@@ -13247,7 +13247,7 @@ static RValue builtin_place_meeting(VMContext* ctx, RValue* args, int32_t argCou
     if (target == INSTANCE_NOONE) return RValue_makeBool(false);
 
 #ifdef PLATFORM_PSP
-    // COLPROF times EVERY place_meeting вЂ” three syscalls per call, and the game leans on
+    // COLPROF times EVERY place_meeting — three syscalls per call, and the game leans on
     // it hard in bullet-hell phases. Only pay it when the reader (diag=full) is listening.
     extern int g_bsDiagLevel;
     const bool colProf = g_bsDiagLevel >= 2;
@@ -14873,7 +14873,7 @@ static RValue builtin_tile_layer_shift(MAYBE_UNUSED VMContext* ctx, RValue* args
 
 // Lazy instanceID -> tile index map for tile_set_alpha. The scan version was
 // O(tileCount) per call; the dark-world darkening (obj_dancer_gen) calls tile_set_alpha
-// for EVERY tile at a depth on EVERY fade frame, i.e. O(tileCount^2)/frame вЂ” a measured
+// for EVERY tile at a depth on EVERY fade frame, i.e. O(tileCount^2)/frame — a measured
 // ~9ms single-frame spike in the dancers room, and the same effect recurs across the
 // chapter. The map rebuilds only when the tile array changes (room load, or explicit
 // invalidation from tile_add/tile_delete below), so lookups amortise to O(1).
@@ -20145,7 +20145,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "part_emitter_region", builtin_part_emitter_region);
     VM_registerBuiltin(ctx, "part_emitter_stream", builtin_part_emitter_stream);
     VM_registerBuiltin(ctx, "part_emitter_burst", builtin_part_emitter_burst);
-    // gameframe extension / windowing / input / misc вЂ” return neutral values
+    // gameframe extension / windowing / input / misc — return neutral values
     VM_registerBuiltin(ctx, "gameframe_check_native_extension", builtin_pt_stub_zero);
     VM_registerBuiltin(ctx, "gameframe_init_raw_raw", builtin_pt_stub_void);
     VM_registerBuiltin(ctx, "gameframe_set_shadow", builtin_pt_stub_void);

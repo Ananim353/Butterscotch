@@ -3056,6 +3056,30 @@ static GMLArray *matrixToGml(int32_t wadVersion, const Matrix4f *mat) {
     }
     return out;
 }
+// matrix_build_projection_perspective(width, height, znear, zfar). GameMaker's arguments are the
+// near-plane extents rather than a field of view, so the frustum is built from them directly.
+static RValue builtin_matrix_build_projection_perspective(VMContext *ctx, RValue *args, int32_t argCount) {
+    Matrix4f m;
+    Matrix4f_identity(&m);
+    if (4 > argCount) return RValue_makeArray(matrixToGml(ctx->dataWin->gen8.wadVersion, &m));
+
+    float width = (float) RValue_toReal(args[0]);
+    float height = (float) RValue_toReal(args[1]);
+    float zNear = (float) RValue_toReal(args[2]);
+    float zFar = (float) RValue_toReal(args[3]);
+    if (0.0f == width || 0.0f == height || zNear == zFar) {
+        return RValue_makeArray(matrixToGml(ctx->dataWin->gen8.wadVersion, &m));
+    }
+
+    memset(&m, 0, sizeof(m));
+    m.m[0]  = (2.0f * zNear) / width;
+    m.m[5]  = (2.0f * zNear) / height;
+    m.m[10] = zFar / (zFar - zNear);
+    m.m[11] = 1.0f;
+    m.m[14] = (-zNear * zFar) / (zFar - zNear);
+    return RValue_makeArray(matrixToGml(ctx->dataWin->gen8.wadVersion, &m));
+}
+
 static RValue builtin_matrix_build_identity(MAYBE_UNUSED VMContext *ctx, MAYBE_UNUSED RValue *args, MAYBE_UNUSED int32_t argCount) {
     Matrix4f id;
     return RValue_makeArray(matrixToGml(ctx->dataWin->gen8.wadVersion, Matrix4f_identity(&id)));
@@ -3553,6 +3577,19 @@ static RValue builtin_room_set_persistent(VMContext* ctx, RValue* args, MAYBE_UN
 }
 
 // GMS2 camera compatibility - we treat view index as camera ID
+// room_get_camera(room, view): the camera bound to a view. We only track the views of the room we
+// are in, so asking about a different room answers -1 rather than inventing a camera for it -- the
+// callers (d3d_set_perspective and friends) ask about the current room anyway.
+static RValue builtin_room_get_camera(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (2 > argCount) return RValue_makeReal(-1);
+    Runner* runner = ctx->runner;
+    int32_t roomIndex = RValue_toInt32(args[0]);
+    int32_t viewIndex = RValue_toInt32(args[1]);
+    if (runner->currentRoom == nullptr || roomIndex != runner->currentRoomIndex) return RValue_makeReal(-1);
+    if (0 > viewIndex || MAX_VIEWS <= viewIndex) return RValue_makeReal(-1);
+    return RValue_makeReal(runner->views[viewIndex].cameraId);
+}
+
 static RValue builtin_view_get_camera(VMContext* ctx, RValue* args, int32_t argCount) {
     if (1 > argCount) return RValue_makeReal(-1);
     Runner* runner = ctx->runner;
@@ -4334,6 +4371,21 @@ static RValue builtin_xboxone_show_account_picker(MAYBE_UNUSED VMContext* ctx, R
     runner->xboxAccountPickerPadIndex = (argCount > 0) ? (int32_t) RValue_toReal(args[0]) : 0;
     return RValue_makeReal((GMLReal) asyncId);
 }
+
+// The depth and culling switches of a 3D pipeline. This renderer draws in painter's order with no
+// depth buffer and no back-face culling, so there is no state to change -- and no state to get
+// wrong either: the d3d_* wrappers that call these set them and put them back around geometry that
+// we draw as flat triangles regardless.
+STUB_RETURN_UNDEFINED(gpu_set_ztestenable)
+STUB_RETURN_UNDEFINED(gpu_set_zwriteenable)
+STUB_RETURN_UNDEFINED(gpu_set_cullmode)
+STUB_RETURN_UNDEFINED(draw_set_lighting)
+
+// Texture wrapping cannot be honoured at all here: sprites live packed in atlas pages, so repeating
+// one would tile its neighbours into view. Saying so through a stub beats a setter that silently
+// does nothing different.
+STUB_RETURN_UNDEFINED(gpu_set_texrepeat)
+STUB_RETURN_FALSE(gpu_get_texrepeat)
 
 // audio_get_recorder_count(): we have no capture device. This is not a placeholder -- 0 is the
 // correct answer, and games branch on it: DELTARUNE Chapter 4 clamps global.microphone to 0 when
@@ -18835,6 +18887,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
 
     // Matrix/linear algebra
     VM_registerBuiltin(ctx, "matrix_build_identity", builtin_matrix_build_identity);
+    VM_registerBuiltin(ctx, "matrix_build_projection_perspective", builtin_matrix_build_projection_perspective);
     VM_registerBuiltin(ctx, "matrix_inverse", builtin_matrix_inverse);
     VM_registerBuiltin(ctx, "matrix_multiply", builtin_matrix_multiply);
     VM_registerBuiltin(ctx, "matrix_build_lookat", builtin_matrix_build_lookat);
@@ -18867,6 +18920,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
 
     // GMS2 camera compatibility
     VM_registerBuiltin(ctx, "view_get_camera", builtin_view_get_camera);
+    VM_registerBuiltin(ctx, "room_get_camera", builtin_room_get_camera);
     VM_registerBuiltin(ctx, "view_get_visible", builtin_view_get_visible);
     VM_registerBuiltin(ctx, "view_get_xport", builtin_view_get_xport);
     VM_registerBuiltin(ctx, "view_get_yport", builtin_view_get_yport);
@@ -19676,6 +19730,12 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     // Same deliberate choice as gpu_set_texfilter above: we render nearest-neighbour on purpose,
     // so honouring a request for linear filtering would work against the look, not for it.
     VM_registerBuiltin(ctx, "gpu_set_tex_filter", builtin_pt_stub_void);
+    VM_registerBuiltin(ctx, "gpu_set_ztestenable", builtin_gpu_set_ztestenable);
+    VM_registerBuiltin(ctx, "gpu_set_zwriteenable", builtin_gpu_set_zwriteenable);
+    VM_registerBuiltin(ctx, "gpu_set_cullmode", builtin_gpu_set_cullmode);
+    VM_registerBuiltin(ctx, "gpu_set_texrepeat", builtin_gpu_set_texrepeat);
+    VM_registerBuiltin(ctx, "gpu_get_texrepeat", builtin_gpu_get_texrepeat);
+    VM_registerBuiltin(ctx, "draw_set_lighting", builtin_draw_set_lighting);
     VM_registerBuiltin(ctx, "texture_prefetch", builtin_texture_prefetch);
     VM_registerBuiltin(ctx, "texture_is_ready", builtin_texture_is_ready);
     VM_registerBuiltin(ctx, "gpu_set_texfilter_ext", builtin_pt_stub_void);

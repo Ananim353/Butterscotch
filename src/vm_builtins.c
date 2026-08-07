@@ -11139,6 +11139,81 @@ static RValue builtin_draw_triangle_color(VMContext* ctx, RValue* args, MAYBE_UN
     return RValue_makeUndefined();
 }
 
+// call_later(period, units, callback, [repeat]): queue a callback. Returns a handle for call_cancel.
+//
+// units is time_source_units_seconds (0) or time_source_units_frames (1); seconds are converted to
+// frames here so the per-frame tick stays a subtraction. The wider time_source_* tree is not
+// modelled -- see Runner_tickPendingCalls.
+static RValue builtin_call_later(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (3 > argCount) return RValue_makeReal(-1.0);
+    Runner* runner = ctx->runner;
+
+    double period = (double) RValue_toReal(args[0]);
+    int32_t units = RValue_toInt32(args[1]);
+    bool repeat = argCount >= 4 && RValue_toBool(args[3]);
+
+    // Seconds -> frames at the room's speed. Rooms without one would turn the delay into zero.
+    if (units == 0) {
+        double fps = runner->currentRoom != nullptr && 0 < runner->currentRoom->speed
+                   ? (double) runner->currentRoom->speed : 30.0;
+        period *= fps;
+    }
+    if (0.0 >= period) period = 1.0;   // "next frame", not "this one, twice"
+
+    int32_t codeIndex = -1;
+    int32_t boundInstanceId = -1;
+#if IS_WAD17_OR_HIGHER_ENABLED
+    if (args[2].type == RVALUE_METHOD && args[2].method != nullptr) {
+        codeIndex = args[2].method->codeIndex;
+        boundInstanceId = args[2].method->boundInstanceId;
+    }
+#endif
+    if (0 > codeIndex) {
+        logWarn("VM: call_later got a callback it cannot run (not a method)\n");
+        return RValue_makeReal(-1.0);
+    }
+    // An unbound method still has to run as somebody: the caller is what GML would use.
+    if (0 > boundInstanceId && ctx->currentInstance != nullptr) {
+        boundInstanceId = (int32_t) ctx->currentInstance->instanceId;
+    }
+
+    PendingCall call = {0};
+    call.id = runner->nextPendingCallId++;
+    call.remaining = period;
+    call.period = period;
+    call.codeIndex = codeIndex;
+    call.boundInstanceId = boundInstanceId;
+    call.repeat = repeat;
+    call.active = true;
+
+    // Reuse a spent slot before growing: a room full of one-shot callbacks would otherwise leave
+    // the array climbing for the whole session.
+    int32_t count = (int32_t) arrlen(runner->pendingCalls);
+    for (int32_t i = 0; i < count; i++) {
+        if (!runner->pendingCalls[i].active) {
+            runner->pendingCalls[i] = call;
+            return RValue_makeReal((GMLReal) call.id);
+        }
+    }
+    arrput(runner->pendingCalls, call);
+    return RValue_makeReal((GMLReal) call.id);
+}
+
+// call_cancel(handle): true if a pending callback was actually dropped.
+static RValue builtin_call_cancel(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (1 > argCount) return RValue_makeBool(false);
+    Runner* runner = ctx->runner;
+    int32_t handle = RValue_toInt32(args[0]);
+    int32_t count = (int32_t) arrlen(runner->pendingCalls);
+    for (int32_t i = 0; i < count; i++) {
+        if (runner->pendingCalls[i].active && runner->pendingCalls[i].id == handle) {
+            runner->pendingCalls[i].active = false;
+            return RValue_makeBool(true);
+        }
+    }
+    return RValue_makeBool(false);
+}
+
 // draw_arrow(x1, y1, x2, y2, size): a line with a filled head at the second point. The head is
 // clamped to the line length, like the runner does, so a short arrow degenerates into just a head.
 static RValue builtin_draw_arrow(VMContext* ctx, RValue* args, int32_t argCount) {
@@ -18664,6 +18739,8 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "draw_point_colour", builtin_draw_point_color);
     VM_registerBuiltin(ctx, "draw_line", builtin_draw_line);
     VM_registerBuiltin(ctx, "draw_arrow", builtin_draw_arrow);
+    VM_registerBuiltin(ctx, "call_later", builtin_call_later);
+    VM_registerBuiltin(ctx, "call_cancel", builtin_call_cancel);
     VM_registerBuiltin(ctx, "draw_line_colour", builtin_draw_line_colour);
     VM_registerBuiltin(ctx, "draw_line_color", builtin_draw_line_colour); // alt-spelling (used in Undertale)
     VM_registerBuiltin(ctx, "draw_line_width", builtin_draw_line_width);

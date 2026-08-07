@@ -398,6 +398,60 @@ int32_t Runner_pushInstancesForTarget(Runner* runner, int32_t target) {
     return base;
 }
 
+// ===[ Deferred Calls (call_later) ]===
+
+// Fires every callback whose delay has run out. Called once per frame, before Step, which is where
+// GameMaker updates its time sources.
+//
+// Entries are never removed from the array while it is being walked: a callback is free to queue
+// another call_later (or cancel one), and a realloc under our feet would leave the loop holding a
+// stale pointer. Dead entries are marked inactive and reused by the next call_later.
+void Runner_tickPendingCalls(Runner* runner) {
+    int32_t count = (int32_t) arrlen(runner->pendingCalls);
+    if (0 >= count) return;
+
+    VMContext* vm = runner->vmContext;
+    for (int32_t i = 0; i < count; i++) {
+        if (!runner->pendingCalls[i].active) continue;
+        if (0.0 < (runner->pendingCalls[i].remaining -= 1.0)) continue;
+
+        // Read the fields out before the call: the callback may push new entries and move the array.
+        int32_t codeIndex = runner->pendingCalls[i].codeIndex;
+        int32_t boundId = runner->pendingCalls[i].boundInstanceId;
+        bool repeat = runner->pendingCalls[i].repeat;
+        double period = runner->pendingCalls[i].period;
+
+        // The callback belongs to the instance that queued it. If that instance is gone -- destroyed,
+        // or left behind in another room -- the call goes with it, as it does in GameMaker.
+        Instance* bound = 0 <= boundId ? VM_findInstanceByTarget(vm, boundId) : nullptr;
+        if (0 <= boundId && (bound == nullptr || !bound->active)) {
+            runner->pendingCalls[i].active = false;
+            continue;
+        }
+
+        if (repeat && 0.0 < period) {
+            runner->pendingCalls[i].remaining = period;
+        } else {
+            runner->pendingCalls[i].active = false;
+        }
+
+        // Both games that use call_later do so deep inside a cutscene, behind a flag no smoke test
+        // reaches, so the first firing announces itself: that log line is the only evidence
+        // available that the scheduler ran at all.
+        static bool firstFireLogged = false;
+        if (!firstFireLogged) {
+            firstFireLogged = true;
+            logInfo("Runner: first deferred call fired (call_later, code %d)\n", codeIndex);
+        }
+
+        Instance* savedInstance = vm->currentInstance;
+        vm->currentInstance = bound;
+        RValue result = VM_callCodeIndex(vm, codeIndex, nullptr, 0);
+        RValue_free(&result);
+        vm->currentInstance = savedInstance;
+    }
+}
+
 // ===[ Event Execution ]===
 
 static void setVMInstanceContext(VMContext* vm, Instance* instance) {
@@ -2309,6 +2363,10 @@ static void cleanupState(Runner* runner) {
     }
     arrfree(runner->dsListPool);
     runner->dsListPool = nullptr;
+
+    // Pending call_later callbacks hold nothing but indices, so dropping the array is enough.
+    arrfree(runner->pendingCalls);
+    runner->pendingCalls = nullptr;
 
     {
     repeat((int32_t) arrlen(runner->dsQueuePool), i) {
@@ -4415,6 +4473,8 @@ void Runner_step(Runner* runner) {
 #ifdef PLATFORM_PSP
     uint32_t bsPhT = BS_DIAG_FULL ? sceKernelGetSystemTimeLow() : 0u; // TEMP STEPPH phase cursor
 #endif
+
+    Runner_tickPendingCalls(runner);
 
     // Save xprevious/yprevious and path_positionprevious for all active instances
     int32_t prevCount = (int32_t) arrlen(runner->instances);

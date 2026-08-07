@@ -290,6 +290,18 @@ typedef struct {
     RValue item;
 } DsPriorityItem;
 
+// One callback queued by call_later. Delays are kept in frames: seconds are converted at the call
+// site, so the tick stays a plain subtraction and does not care which unit was asked for.
+typedef struct {
+    int32_t id;
+    double remaining;         // frames left before it fires
+    double period;            // frames between repeats; only read when repeat is set
+    int32_t codeIndex;
+    int32_t boundInstanceId;  // self the callback runs as; the entry dies with that instance
+    bool repeat;
+    bool active;
+} PendingCall;
+
 // ds_list: dynamic array of RValues
 typedef struct {
     RValue* items; // stb_ds dynamic array of RValues
@@ -554,6 +566,12 @@ struct Runner {
 
     // ===[ Builtin function state ]===
     DsMapEntry** dsMapPool; // stb_ds array of stb_ds hashmaps
+    // call_later: callbacks waiting to fire, ticked once per frame from Runner_step.
+    // GML's wider time_source_* tree is deliberately not modelled -- games reach for call_later on
+    // its own, and none of the ones we run build a source hierarchy.
+    PendingCall* pendingCalls;   // stb_ds array; entries stay in place and are marked inactive
+    int32_t nextPendingCallId;
+
     DsList* dsListPool; // stb_ds array of DsList
     DsQueue* dsQueuePool; // stb_ds array of DsQueue
     DsStack* dsStackPool; // stb_ds array of DsStack
@@ -672,6 +690,7 @@ void Runner_initFirstRoom(Runner* runner);
 // Not a boot override — ROOM_INITIALIZE must run first or the room's globals are undefined.
 void Runner_setStartRoom(int32_t roomIndex);
 void Runner_step(Runner* runner);
+void Runner_tickPendingCalls(Runner* runner);
 void Runner_handlePendingRoomChange(Runner* runner);
 
 // True when every enabled follow-camera sits where its follow logic (at unlimited

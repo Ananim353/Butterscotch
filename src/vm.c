@@ -1758,8 +1758,19 @@ static void handleRem(VMContext* ctx, uint32_t instr) {
 static void handleMod(VMContext* ctx, uint32_t instr) {
     RValue b = stackPop(ctx);
     RValue a = stackPop(ctx);
+    uint8_t type1 = instrType1(instr);
+    uint8_t type2 = instrType2(instr);
     GMLReal divisor = RValue_toReal(b);
-    requireMessageFormatted(__FILE__, __LINE__, divisor != 0.0, "VM: [%s] DoMod :: Divide by zero", ctx->currentCodeName);
+    // Same rule handleDiv already applies: only integer/integer throws on zero in the native
+    // runner, everything else is fmod and comes back NaN.
+    //
+    // This is not theoretical. obj_plat_combatstarter's Draw does "i % array_length(colors)", and
+    // colors is filled by its Step -- but GameMaker runs the new room's Draw before its first Step,
+    // so on the frame the room opens the array is genuinely empty. The real game survives that one
+    // frame; aborting turned it into a black screen with no trace on PSP.
+    if ((type1 == GML_TYPE_INT32 || type1 == GML_TYPE_INT64) && (type2 == GML_TYPE_INT32 || type2 == GML_TYPE_INT64)) {
+        requireMessageFormatted(__FILE__, __LINE__, divisor != 0.0, "VM: [%s] DoMod :: Divide by zero", ctx->currentCodeName);
+    }
     GMLReal result = GMLReal_fmod(RValue_toReal(a), divisor);
     RValue_free(&a);
     RValue_free(&b);

@@ -5988,10 +5988,11 @@ static RValue builtin_ds_priority_delete_min(MAYBE_UNUSED VMContext* ctx, RValue
     DsPriority* pQueue = dsPriorityGet(ctx->runner, id);
     if (pQueue == nullptr) return RValue_makeUndefined();
     if (arrlen(pQueue->items) <= 0) return RValue_makeUndefined();
-    GMLReal minDepth = (GMLReal) INT32_MAX;
-    DsPriorityItem* minNode = nullptr;
-    int32_t minIndex = -1;
-    for (int32_t i = 0; i < arrlen(pQueue->items); i++) {
+    // Seeded from the first item; see ds_priority_find_min for why a sentinel is not safe here.
+    GMLReal minDepth = (GMLReal) pQueue->items[0].depth;
+    DsPriorityItem* minNode = &pQueue->items[0];
+    int32_t minIndex = 0;
+    for (int32_t i = 1; i < arrlen(pQueue->items); i++) {
         DsPriorityItem* item = &pQueue->items[i];
         if (item->depth < minDepth) {
             minDepth = (GMLReal) item->depth;
@@ -6009,9 +6010,13 @@ static RValue builtin_ds_priority_find_min(MAYBE_UNUSED VMContext* ctx, RValue* 
     DsPriority* pQueue = dsPriorityGet(ctx->runner, id);
     if (pQueue == nullptr) return RValue_makeUndefined();
     if (arrlen(pQueue->items) <= 0) return RValue_makeUndefined();
-    GMLReal minDepth = (GMLReal) INT32_MAX;
-    DsPriorityItem* minNode = nullptr;
-    for (int32_t i = 0; i < arrlen(pQueue->items); i++) {
+    // Seeded from the first item, not from a sentinel. A sentinel loses to nothing when a depth is
+    // NaN -- every comparison against NaN is false -- and the search then finishes with a null node
+    // that the callers dereference. Starting at item 0 makes the result total for any non-empty
+    // queue, whatever the depths hold.
+    GMLReal minDepth = (GMLReal) pQueue->items[0].depth;
+    DsPriorityItem* minNode = &pQueue->items[0];
+    for (int32_t i = 1; i < arrlen(pQueue->items); i++) {
         DsPriorityItem* item = &pQueue->items[i];
         if (item->depth < minDepth) {
             minDepth = (GMLReal) item->depth;
@@ -6026,10 +6031,11 @@ static RValue builtin_ds_priority_delete_max(MAYBE_UNUSED VMContext* ctx, RValue
     DsPriority* pQueue = dsPriorityGet(ctx->runner, id);
     if (pQueue == nullptr) return RValue_makeUndefined();
     if (arrlen(pQueue->items) <= 0) return RValue_makeUndefined();
-    GMLReal maxDepth = (GMLReal) INT32_MIN;
-    DsPriorityItem* maxNode = nullptr;
-    int32_t maxIndex = -1;
-    for (int32_t i = 0; i < arrlen(pQueue->items); i++) {
+    // Seeded from the first item; see ds_priority_find_min for why a sentinel is not safe here.
+    GMLReal maxDepth = (GMLReal) pQueue->items[0].depth;
+    DsPriorityItem* maxNode = &pQueue->items[0];
+    int32_t maxIndex = 0;
+    for (int32_t i = 1; i < arrlen(pQueue->items); i++) {
         DsPriorityItem* item = &pQueue->items[i];
         if (item->depth > maxDepth) {
             maxDepth = (GMLReal) item->depth;
@@ -6047,9 +6053,13 @@ static RValue builtin_ds_priority_find_max(MAYBE_UNUSED VMContext* ctx, RValue* 
     DsPriority* pQueue = dsPriorityGet(ctx->runner, id);
     if (pQueue == nullptr) return RValue_makeUndefined();
     if (arrlen(pQueue->items) <= 0) return RValue_makeUndefined();
-    GMLReal maxDepth = (GMLReal) INT32_MIN;
-    DsPriorityItem* maxNode = nullptr;
-    for (int32_t i = 0; i < arrlen(pQueue->items); i++) {
+    // Seeded from the first item, not from a sentinel. A sentinel loses to nothing when a depth is
+    // NaN -- every comparison against NaN is false -- and the search then finishes with a null node
+    // that the callers dereference. Starting at item 0 makes the result total for any non-empty
+    // queue, whatever the depths hold.
+    GMLReal maxDepth = (GMLReal) pQueue->items[0].depth;
+    DsPriorityItem* maxNode = &pQueue->items[0];
+    for (int32_t i = 1; i < arrlen(pQueue->items); i++) {
         DsPriorityItem* item = &pQueue->items[i];
         if (item->depth > maxDepth) {
             maxDepth = (GMLReal) item->depth;

@@ -566,6 +566,10 @@ struct Runner {
 
     // ===[ Builtin function state ]===
     DsMapEntry** dsMapPool; // stb_ds array of stb_ds hashmaps
+    // audio_group_set_gain: per-group multiplier, indexed by AGRP group. Grown on demand; a group
+    // that was never set reads as 1.0 rather than needing the array to cover it.
+    float* audioGroupGains;   // stb_ds array
+
     // call_later: callbacks waiting to fire, ticked once per frame from Runner_step.
     // GML's wider time_source_* tree is deliberately not modelled -- games reach for call_later on
     // its own, and none of the ones we run build a source hierarchy.

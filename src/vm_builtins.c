@@ -6745,6 +6745,63 @@ static AudioSystem* getAudioSystem(VMContext* ctx) {
     return runner->audioSystem;
 }
 
+// ===[ Audio Groups ]===
+//
+// Group gain is a multiplier the runner keeps, not something the backends know about: every one of
+// them computes a voice's volume its own way, and threading a second factor through four mixers to
+// serve one settings slider is not worth it. Instead the gain is applied where a sound meets the
+// mixer -- on the instance a play returns, and on the live instances of every sound in the group
+// when the group's gain changes.
+static float audioGroupGain(Runner* runner, int32_t groupIndex) {
+    if (0 > groupIndex || (int32_t) arrlen(runner->audioGroupGains) <= groupIndex) return 1.0f;
+    return runner->audioGroupGains[groupIndex];
+}
+
+static float audioGroupGainForSound(Runner* runner, int32_t soundIndex) {
+    if (0 > soundIndex || runner->dataWin->sond.count <= (uint32_t) soundIndex) return 1.0f;
+    return audioGroupGain(runner, runner->dataWin->sond.sounds[soundIndex].audioGroup);
+}
+
+// Applies the group's gain to a freshly started instance. A sound's own volume is the baseline the
+// backend already used, so the two multiply rather than replace one another.
+static void audioApplyGroupGain(Runner* runner, int32_t soundIndex, int32_t instanceId) {
+    if (0 > instanceId || 0 > soundIndex || runner->dataWin->sond.count <= (uint32_t) soundIndex) return;
+    float gain = audioGroupGainForSound(runner, soundIndex);
+    if (gain == 1.0f) return;
+    runner->audioSystem->vtable->setSoundGain(runner->audioSystem, instanceId,
+                                              runner->dataWin->sond.sounds[soundIndex].volume * gain, 0);
+}
+
+// audio_group_set_gain(group, gain, timeMs)
+static RValue builtin_audio_group_set_gain(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (2 > argCount) return RValue_makeUndefined();
+    Runner* runner = ctx->runner;
+    AudioSystem* audio = getAudioSystem(ctx);
+    if (audio == nullptr) return RValue_makeUndefined();
+
+    int32_t groupIndex = RValue_toInt32(args[0]);
+    float gain = (float) RValue_toReal(args[1]);
+    uint32_t timeMs = argCount >= 3 ? (uint32_t) RValue_toInt32(args[2]) : 0u;
+    if (0 > groupIndex) return RValue_makeUndefined();
+
+    while ((int32_t) arrlen(runner->audioGroupGains) <= groupIndex) arrput(runner->audioGroupGains, 1.0f);
+    runner->audioGroupGains[groupIndex] = gain;
+
+    // Catch up whatever is already playing. Passing a sound index reaches its live instances; a
+    // sound that is silent right now picks the gain up from audioApplyGroupGain when it next plays.
+    repeat(runner->dataWin->sond.count, i) {
+        Sound* sound = &runner->dataWin->sond.sounds[i];
+        if (!sound->present || sound->audioGroup != groupIndex) continue;
+        audio->vtable->setSoundGain(audio, (int32_t) i, sound->volume * gain, timeMs);
+    }
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_audio_group_get_gain(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (1 > argCount) return RValue_makeReal(1.0);
+    return RValue_makeReal((GMLReal) audioGroupGain(ctx->runner, RValue_toInt32(args[0])));
+}
+
 static RValue builtin_audio_system_is_available(MAYBE_UNUSED VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
     logSemiStubbedFunction(ctx, "audio_system_is_available");
     return RValue_makeBool(true);
@@ -6791,6 +6848,7 @@ static RValue builtin_sound_play(VMContext* ctx, RValue* args, MAYBE_UNUSED int3
 
     int32_t soundIndex = RValue_toInt32(args[0]);
     int32_t instanceId = audio->vtable->playSound(audio, soundIndex, 10, false);
+    audioApplyGroupGain(ctx->runner, soundIndex, instanceId);
     return RValue_makeReal((GMLReal) instanceId);
 }
 
@@ -6824,6 +6882,7 @@ static RValue builtin_sound_loop(VMContext* ctx, RValue* args, MAYBE_UNUSED int3
 
     int32_t soundIndex = RValue_toInt32(args[0]);
     int32_t instanceId = audio->vtable->playSound(audio, soundIndex, 10, true);
+    audioApplyGroupGain(ctx->runner, soundIndex, instanceId);
     return RValue_makeReal((GMLReal) instanceId);
 }
 
@@ -6852,6 +6911,7 @@ static RValue builtin_audio_play_sound(VMContext* ctx, RValue* args, MAYBE_UNUSE
     int32_t priority = RValue_toInt32(args[1]);
     bool loop = RValue_toBool(args[2]);
     int32_t instanceId = audio->vtable->playSound(audio, soundIndex, priority, loop);
+    audioApplyGroupGain(ctx->runner, soundIndex, instanceId);
     return RValue_makeReal((GMLReal) instanceId);
 }
 
@@ -6866,6 +6926,7 @@ static RValue builtin_action_sound(VMContext* ctx, RValue* args, MAYBE_UNUSED in
     int32_t soundIndex = RValue_toInt32(args[0]);
     bool loop = RValue_toBool(args[1]);
     int32_t instanceId = audio->vtable->playSound(audio, soundIndex, 10, loop);
+    audioApplyGroupGain(ctx->runner, soundIndex, instanceId);
     return RValue_makeReal((GMLReal) instanceId);
 }
 
@@ -18596,6 +18657,8 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "audio_master_gain", builtin_audio_master_gain);
     VM_registerBuiltin(ctx, "audio_set_master_gain", builtin_audio_set_master_gain);
     VM_registerBuiltin(ctx, "audio_group_load", builtin_audio_group_load);
+    VM_registerBuiltin(ctx, "audio_group_set_gain", builtin_audio_group_set_gain);
+    VM_registerBuiltin(ctx, "audio_group_get_gain", builtin_audio_group_get_gain);
     VM_registerBuiltin(ctx, "audio_get_recorder_count", builtin_audio_get_recorder_count);
     VM_registerBuiltin(ctx, "audio_get_recorder_info", builtin_audio_get_recorder_info);
     VM_registerBuiltin(ctx, "audio_group_is_loaded", builtin_audio_group_is_loaded);

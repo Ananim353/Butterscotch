@@ -2368,6 +2368,9 @@ static void cleanupState(Runner* runner) {
     arrfree(runner->pendingCalls);
     runner->pendingCalls = nullptr;
 
+    arrfree(runner->audioGroupGains);
+    runner->audioGroupGains = nullptr;
+
     {
     repeat((int32_t) arrlen(runner->dsQueuePool), i) {
         DsQueue* q = &runner->dsQueuePool[i];

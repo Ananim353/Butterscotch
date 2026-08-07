@@ -10102,6 +10102,55 @@ static RValue builtin_buffer_delete(MAYBE_UNUSED VMContext* ctx, RValue* args, M
     return RValue_makeUndefined();
 }
 
+// buffer_poke(buffer, offset, type, value): a write at an absolute offset that leaves the buffer's
+// own cursor alone. Strings are refused rather than half-written -- their length is not implied by
+// the type, so a poke cannot know what it is overwriting.
+static RValue builtin_buffer_poke(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (4 > argCount) return RValue_makeUndefined();
+    GmlBuffer* buf = gmlBufferGet(ctx->runner, RValue_toInt32(args[0]));
+    int32_t offset = RValue_toInt32(args[1]);
+    int32_t dataType = RValue_toInt32(args[2]);
+    if (buf == nullptr || 0 > offset) return RValue_makeUndefined();
+
+    int32_t width;
+    switch (dataType) {
+        case GML_BUFTYPE_U8: case GML_BUFTYPE_S8: case GML_BUFTYPE_BOOL: width = 1; break;
+        case GML_BUFTYPE_U16: case GML_BUFTYPE_S16: case GML_BUFTYPE_F16: width = 2; break;
+        case GML_BUFTYPE_U32: case GML_BUFTYPE_S32: case GML_BUFTYPE_F32: width = 4; break;
+        case GML_BUFTYPE_U64: case GML_BUFTYPE_F64: width = 8; break;
+        default:
+            logWarn("VM: buffer_poke cannot write data type %d\n", dataType);
+            return RValue_makeUndefined();
+    }
+
+    gmlBufferEnsureSize(buf, offset + width);
+    if (offset + width > buf->size) return RValue_makeUndefined();
+
+    uint8_t* at = buf->data + offset;
+    switch (dataType) {
+        case GML_BUFTYPE_U8: case GML_BUFTYPE_S8: case GML_BUFTYPE_BOOL: {
+            uint8_t v = (uint8_t) RValue_toInt32(args[3]); memcpy(at, &v, 1); break;
+        }
+        case GML_BUFTYPE_U16: case GML_BUFTYPE_S16: case GML_BUFTYPE_F16: {
+            uint16_t v = (uint16_t) RValue_toInt32(args[3]); memcpy(at, &v, 2); break;
+        }
+        case GML_BUFTYPE_F32: {
+            float v = (float) RValue_toReal(args[3]); memcpy(at, &v, 4); break;
+        }
+        case GML_BUFTYPE_U32: case GML_BUFTYPE_S32: {
+            uint32_t v = (uint32_t) RValue_toInt32(args[3]); memcpy(at, &v, 4); break;
+        }
+        case GML_BUFTYPE_F64: {
+            double v = (double) RValue_toReal(args[3]); memcpy(at, &v, 8); break;
+        }
+        default: {
+            uint64_t v = (uint64_t) RValue_toInt64(args[3]); memcpy(at, &v, 8); break;
+        }
+    }
+    if (buf->type == GML_BUFFER_GROW && offset + width > buf->usedSize) buf->usedSize = offset + width;
+    return RValue_makeUndefined();
+}
+
 // buffer_resize(buffer, size). A grow buffer resizes itself on write, but the game may ask for the
 // space up front, and a fixed one has no other way to change size.
 static RValue builtin_buffer_resize(VMContext* ctx, RValue* args, int32_t argCount) {
@@ -19754,6 +19803,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "buffer_exists", builtin_buffer_exists);
     VM_registerBuiltin(ctx, "buffer_write", builtin_buffer_write);
     VM_registerBuiltin(ctx, "buffer_copy", builtin_buffer_copy);
+    VM_registerBuiltin(ctx, "buffer_poke", builtin_buffer_poke);
     VM_registerBuiltin(ctx, "buffer_fill", builtin_buffer_fill);
     VM_registerBuiltin(ctx, "buffer_resize", builtin_buffer_resize);
     VM_registerBuiltin(ctx, "buffer_read", builtin_buffer_read);

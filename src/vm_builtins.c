@@ -14987,9 +14987,12 @@ static RValue builtin_layer_tile_visible(VMContext* ctx, RValue* args, MAYBE_UNU
 }
 
 static bool isValidLayerSpriteElement(RuntimeLayerElement* element) {
-    bool isValid = element != nullptr && element->type == RuntimeLayerElementType_Sprite;
+    // The null check has to short-circuit the requireNotNull below, not sit beside it: every caller
+    // passes the result of Runner_findLayerElementById, which returns null for an id that is gone,
+    // and reading element->spriteElement to check it would be the crash it is meant to prevent.
+    if (element == nullptr || element->type != RuntimeLayerElementType_Sprite) return false;
     requireNotNull(element->spriteElement); // If this crashes then something went DEEPLY wrong
-    return isValid;
+    return true;
 }
 
 static RValue builtin_layer_sprite_get_id(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
@@ -15124,6 +15127,92 @@ static RValue builtin_layer_sprite_blend(VMContext* ctx, RValue* args, MAYBE_UNU
     if (isValidLayerSpriteElement(el))
         el->blend = RValue_toBool(args[1]);
     return RValue_makeUndefined();
+}
+
+static RValue builtin_layer_sprite_x(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    RuntimeLayerElement* el = Runner_findLayerElementById(ctx->runner, RValue_toInt32(args[0]), nullptr);
+    if (isValidLayerSpriteElement(el))
+        el->spriteElement->x = RValue_toInt32(args[1]);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_layer_sprite_y(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    RuntimeLayerElement* el = Runner_findLayerElementById(ctx->runner, RValue_toInt32(args[0]), nullptr);
+    if (isValidLayerSpriteElement(el))
+        el->spriteElement->y = RValue_toInt32(args[1]);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_layer_sprite_alpha(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    RuntimeLayerElement* el = Runner_findLayerElementById(ctx->runner, RValue_toInt32(args[0]), nullptr);
+    if (isValidLayerSpriteElement(el))
+        el->alpha = (float) RValue_toReal(args[1]);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_layer_sprite_index(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    RuntimeLayerElement* el = Runner_findLayerElementById(ctx->runner, RValue_toInt32(args[0]), nullptr);
+    if (isValidLayerSpriteElement(el))
+        el->spriteElement->frameIndex = (float) RValue_toReal(args[1]);
+    return RValue_makeUndefined();
+}
+
+// layer_sprite_change(element, sprite): swaps the sprite, keeping position, scale and blend.
+static RValue builtin_layer_sprite_change(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
+    RuntimeLayerElement* el = Runner_findLayerElementById(ctx->runner, RValue_toInt32(args[0]), nullptr);
+    if (!isValidLayerSpriteElement(el)) return RValue_makeUndefined();
+
+    int32_t spriteIndex = RValue_toInt32(args[1]);
+    el->spriteElement->spriteIndex = spriteIndex;
+
+    // A shorter sprite would otherwise keep a frame index it no longer has, and the draw path
+    // would index past the frame list.
+    if (0 <= spriteIndex && (uint32_t) spriteIndex < ctx->dataWin->sprt.count) {
+        int32_t frames = (int32_t) ctx->dataWin->sprt.sprites[spriteIndex].textureCount;
+        if (0 < frames && el->spriteElement->frameIndex >= (float) frames) el->spriteElement->frameIndex = 0.0f;
+    }
+    return RValue_makeUndefined();
+}
+
+// layer_sprite_exists(layer, element): true only when that element lives on that specific layer.
+static RValue builtin_layer_sprite_exists(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (2 > argCount) return RValue_makeBool(false);
+    RuntimeLayer* owningLayer = nullptr;
+    RuntimeLayerElement* el = Runner_findLayerElementById(ctx->runner, RValue_toInt32(args[1]), &owningLayer);
+    if (!isValidLayerSpriteElement(el) || owningLayer == nullptr) return RValue_makeBool(false);
+    return RValue_makeBool((int32_t) owningLayer->id == RValue_toInt32(args[0]));
+}
+
+// layer_sprite_create(layer, x, y, sprite): adds a sprite element and returns its id, or -1.
+static RValue builtin_layer_sprite_create(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (4 > argCount) return RValue_makeReal(-1.0);
+    Runner* runner = ctx->runner;
+    RuntimeLayer* layer = Runner_findRuntimeLayerById(runner, RValue_toInt32(args[0]));
+    if (layer == nullptr) return RValue_makeReal(-1.0);
+
+    RuntimeSpriteElement* spriteElement = (RuntimeSpriteElement *)safeCalloc(1, sizeof(RuntimeSpriteElement));
+    spriteElement->name = nullptr;   // created at runtime, so it has no name to be found by
+    spriteElement->spriteIndex = RValue_toInt32(args[3]);
+    spriteElement->x = RValue_toInt32(args[1]);
+    spriteElement->y = RValue_toInt32(args[2]);
+    spriteElement->scaleX = 1.0f;
+    spriteElement->scaleY = 1.0f;
+    spriteElement->color = 0xFFFFFFFFu;
+    spriteElement->animationSpeed = 1.0f;
+    spriteElement->frameIndex = 0.0f;
+    spriteElement->rotation = 0.0f;
+
+    RuntimeLayerElement el = {0};
+    el.id = Runner_getNextLayerId(runner);
+    el.type = RuntimeLayerElementType_Sprite;
+    el.visible = true;
+    el.alpha = 1.0f;
+    el.blend = 0xFFFFFFu;
+    el.spriteElement = spriteElement;
+    arrput(layer->elements, el);
+
+    runner->drawableListStructureDirty = true;
+    return RValue_makeReal((GMLReal) el.id);
 }
 
 static RValue builtin_layer_sprite_get_index(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
@@ -19115,6 +19204,13 @@ void VMBuiltins_registerAll(VMContext* ctx) {
 #endif
     VM_registerBuiltin(ctx, "layer_get_element_type", builtin_layer_get_element_type);
     VM_registerBuiltin(ctx, "layer_sprite_get_id", builtin_layer_sprite_get_id);
+    VM_registerBuiltin(ctx, "layer_sprite_create", builtin_layer_sprite_create);
+    VM_registerBuiltin(ctx, "layer_sprite_exists", builtin_layer_sprite_exists);
+    VM_registerBuiltin(ctx, "layer_sprite_change", builtin_layer_sprite_change);
+    VM_registerBuiltin(ctx, "layer_sprite_index", builtin_layer_sprite_index);
+    VM_registerBuiltin(ctx, "layer_sprite_alpha", builtin_layer_sprite_alpha);
+    VM_registerBuiltin(ctx, "layer_sprite_x", builtin_layer_sprite_x);
+    VM_registerBuiltin(ctx, "layer_sprite_y", builtin_layer_sprite_y);
     VM_registerBuiltin(ctx, "layer_sprite_get_sprite", builtin_layer_sprite_get_sprite);
     VM_registerBuiltin(ctx, "layer_sprite_get_x", builtin_layer_sprite_get_x);
     VM_registerBuiltin(ctx, "layer_sprite_get_y", builtin_layer_sprite_get_y);

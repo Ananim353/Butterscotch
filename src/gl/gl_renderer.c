@@ -2049,6 +2049,13 @@ static bool glSurfaceGetPixels(Renderer* renderer, int32_t surfaceId, uint8_t* o
     return GLCommon_surfaceGetPixels(gl->surfaces, gl->surfaceWidth, gl->surfaceHeight, gl->surfaceCount, surfaceId, outRGBA);
 }
 
+static bool glSurfaceSetPixels(Renderer* renderer, int32_t surfaceId, const uint8_t* rgba) {
+    GLRenderer* gl = (GLRenderer*) renderer;
+    // Drain first: queued quads may still be sampling this surface, and the upload would land under them.
+    flushBatch(gl);
+    return GLCommon_surfaceSetPixels(gl->surfaceTexture, gl->surfaceWidth, gl->surfaceHeight, gl->surfaceCount, surfaceId, rgba);
+}
+
 static bool glSetRenderTarget(Renderer* renderer, int32_t surfaceId, bool implicitApplicationSurface) {
     GLRenderer* gl = (GLRenderer*) renderer;
     flushBatch(gl);
@@ -2772,6 +2779,7 @@ Renderer* GLRenderer_create(void) {
     glVtable.ensureApplicationSurface = glEnsureApplicationSurface;
     glVtable.surfaceCopy = glSurfaceCopy;
     glVtable.surfaceGetPixels = glSurfaceGetPixels;
+    glVtable.surfaceSetPixels = glSurfaceSetPixels;
     glVtable.getSurfaceWidth = glGetSurfaceWidth;
     glVtable.getSurfaceHeight = glGetSurfaceHeight;
     glVtable.drawSurface = glDrawSurface;

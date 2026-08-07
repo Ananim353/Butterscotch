@@ -10077,6 +10077,31 @@ static RValue builtin_filename_name(MAYBE_UNUSED VMContext* ctx, RValue* args, i
 
 // buffer_get_surface(buffer, surface, offset) -> bool
 // Reads RGBA8 pixels from the surface into the buffer at the given offset.
+// buffer_set_surface(buffer, surface, offset): the inverse of buffer_get_surface. Used by
+// obj_zen_sand in DELTARUNE Chapter 5 to restore the sand it drew earlier in the room.
+static RValue builtin_buffer_set_surface(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (3 > argCount) return RValue_makeBool(false);
+    Runner* runner = ctx->runner;
+    int32_t bufId = RValue_toInt32(args[0]);
+    int32_t surfaceId = RValue_toInt32(args[1]);
+    int32_t offset = RValue_toInt32(args[2]);
+    GmlBuffer* buf = gmlBufferGet(runner, bufId);
+    if (buf == nullptr || runner->renderer == nullptr) return RValue_makeBool(false);
+    if (runner->renderer->vtable->surfaceSetPixels == nullptr) return RValue_makeBool(false);
+    if (!Renderer_surfaceExists(runner->renderer, surfaceId)) return RValue_makeBool(false);
+
+    int32_t w = (int32_t) Renderer_getSurfaceWidth(runner->renderer, surfaceId);
+    int32_t h = (int32_t) Renderer_getSurfaceHeight(runner->renderer, surfaceId);
+    if (0 >= w || 0 >= h) return RValue_makeBool(false);
+
+    // Unlike the read side we must not grow the buffer: a short one means the caller is handing us
+    // something that is not a picture of this surface, and uploading past its end would read heap.
+    int32_t bytes = w * h * 4;
+    if (0 > offset || offset + bytes > buf->size) return RValue_makeBool(false);
+
+    return RValue_makeBool(runner->renderer->vtable->surfaceSetPixels(runner->renderer, surfaceId, buf->data + offset));
+}
+
 static RValue builtin_buffer_get_surface(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
     Runner* runner = ctx->runner;
     int32_t bufId = RValue_toInt32(args[0]);
@@ -11766,6 +11791,51 @@ static RValue builtin_draw_surface_part(VMContext* ctx, RValue* args, MAYBE_UNUS
     }
     return RValue_makeUndefined();
 }
+
+// draw_surface_general(surface, left, top, w, h, x, y, xscale, yscale, rot, c1, c2, c3, c4, alpha)
+//
+// Everything except the four corner colours maps straight onto drawSurface. A per-corner gradient
+// would need a textured-quad entry point the vtable does not have, so the first colour is used for
+// the whole quad and a mismatch says so once. The one caller in DELTARUNE (obj_omega_book_word,
+// the Omega book's letters) passes c_white four times, which this renders exactly.
+static RValue builtin_draw_surface_general(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (15 > argCount) return RValue_makeUndefined();
+    Runner* runner = ctx->runner;
+    if (runner->renderer == nullptr) return RValue_makeUndefined();
+
+    int32_t surfaceId = (int32_t) RValue_toReal(args[0]);
+    int32_t left = (int32_t) RValue_toReal(args[1]);
+    int32_t top = (int32_t) RValue_toReal(args[2]);
+    int32_t w = (int32_t) RValue_toReal(args[3]);
+    int32_t h = (int32_t) RValue_toReal(args[4]);
+    float x = (float) RValue_toReal(args[5]);
+    float y = (float) RValue_toReal(args[6]);
+    float xscale = (float) RValue_toReal(args[7]);
+    float yscale = (float) RValue_toReal(args[8]);
+    float rot = (float) RValue_toReal(args[9]);
+    uint32_t c1 = (uint32_t) RValue_toInt32(args[10]);
+    uint32_t c2 = (uint32_t) RValue_toInt32(args[11]);
+    uint32_t c3 = (uint32_t) RValue_toInt32(args[12]);
+    uint32_t c4 = (uint32_t) RValue_toInt32(args[13]);
+    float alpha = (float) RValue_toReal(args[14]);
+
+    if (c1 != c2 || c1 != c3 || c1 != c4) {
+        static bool gradientWarned = false;
+        if (!gradientWarned) {
+            gradientWarned = true;
+            logWarn("VM: draw_surface_general ignores its per-corner gradient; drawing with the first colour\n");
+        }
+    }
+
+    runner->renderer->vtable->drawSurface(runner->renderer, surfaceId, left, top, w, h, x, y, xscale, yscale, rot, c1, alpha);
+    return RValue_makeUndefined();
+}
+
+// texture_prefetch/texture_is_ready: pages are resident once the game is running, so there is
+// nothing to prefetch and nothing to wait for. Real work for these belongs to a backend that
+// streams textures, not to the shared runner.
+STUB_RETURN_UNDEFINED(texture_prefetch)
+STUB_RETURN_TRUE(texture_is_ready)
 
 static RValue builtin_draw_surface_part_ext(VMContext* ctx, RValue* args, MAYBE_UNUSED int32_t argCount) {
 
@@ -18662,6 +18732,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "buffer_md5", builtin_buffer_md5);
     VM_registerBuiltin(ctx, "buffer_sha1", builtin_buffer_sha1);
     VM_registerBuiltin(ctx, "buffer_get_surface", builtin_buffer_get_surface);
+    VM_registerBuiltin(ctx, "buffer_set_surface", builtin_buffer_set_surface);
     VM_registerBuiltin(ctx, "sha1_file", builtin_sha1_file);
     VM_registerBuiltin(ctx, "md5_file", builtin_md5_file);
 
@@ -18714,6 +18785,7 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "draw_surface_ext", builtin_draw_surface_ext);
     VM_registerBuiltin(ctx, "draw_surface_part", builtin_draw_surface_part);
     VM_registerBuiltin(ctx, "draw_surface_part_ext", builtin_draw_surface_part_ext);
+    VM_registerBuiltin(ctx, "draw_surface_general", builtin_draw_surface_general);
     VM_registerBuiltin(ctx, "draw_surface_stretched", builtin_draw_surface_stretched);
     VM_registerBuiltin(ctx, "draw_surface_stretched_ext", builtin_draw_surface_stretched_ext);
     VM_registerBuiltin(ctx, "draw_surface_tiled", builtin_draw_surface_tiled);
@@ -18993,6 +19065,11 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "display_get_dpi_x", builtin_pt_stub_zero);
     VM_registerBuiltin(ctx, "switch_get_operation_mode", builtin_pt_stub_zero);
     VM_registerBuiltin(ctx, "gpu_set_texfilter", builtin_pt_stub_void);
+    // Same deliberate choice as gpu_set_texfilter above: we render nearest-neighbour on purpose,
+    // so honouring a request for linear filtering would work against the look, not for it.
+    VM_registerBuiltin(ctx, "gpu_set_tex_filter", builtin_pt_stub_void);
+    VM_registerBuiltin(ctx, "texture_prefetch", builtin_texture_prefetch);
+    VM_registerBuiltin(ctx, "texture_is_ready", builtin_texture_is_ready);
     VM_registerBuiltin(ctx, "gpu_set_texfilter_ext", builtin_pt_stub_void);
     VM_registerBuiltin(ctx, "font_add_enable_aa", builtin_pt_stub_void);
     VM_registerBuiltin(ctx, "gamepad_set_vibration", builtin_pt_stub_void);

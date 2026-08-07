@@ -1825,6 +1825,11 @@ static bool glLegacySurfaceGetPixels(Renderer* renderer, int32_t surfaceId, uint
     return GLCommon_surfaceGetPixels(gl->surfaces, gl->surfaceWidth, gl->surfaceHeight, gl->surfaceCount, surfaceId, outRGBA);
 }
 
+static bool glLegacySurfaceSetPixels(Renderer* renderer, int32_t surfaceId, const uint8_t* rgba) {
+    GLLegacyRenderer* gl = (GLLegacyRenderer*) renderer;
+    return GLCommon_surfaceSetPixels(gl->surfaceTexture, gl->surfaceWidth, gl->surfaceHeight, gl->surfaceCount, surfaceId, rgba);
+}
+
 
 // ===[ Vtable ]===
 
@@ -2009,6 +2014,7 @@ Renderer* GLLegacyRenderer_create(void) {
     glVtable.surfaceFree = glLegacySurfaceFree;
     glVtable.surfaceCopy = glLegacySurfaceCopy;
     glVtable.surfaceGetPixels = glLegacySurfaceGetPixels;
+    glVtable.surfaceSetPixels = glLegacySurfaceSetPixels;
     glVtable.spriteGetTexture = glSpriteGetTexture;
     glVtable.surfaceGetTexture = glSurfaceGetTexture;
     glVtable.textureGetTexelWidth = glTextureGetTexelWidth;

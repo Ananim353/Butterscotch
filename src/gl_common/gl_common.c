@@ -140,6 +140,42 @@ bool GLCommon_surfaceGetPixels(GLuint* surfaces, int32_t* surfaceWidth, int32_t*
     return true;
 }
 
+bool GLCommon_surfaceSetPixels(GLuint* surfaceTextures, int32_t* surfaceWidth, int32_t* surfaceHeight, uint32_t count, int32_t surfaceId, const uint8_t* rgba) {
+    if (0 > surfaceId || (uint32_t) surfaceId >= count)
+        return false;
+
+    if (surfaceTextures[surfaceId] == 0)
+        return false;
+
+    int32_t w = surfaceWidth[surfaceId];
+    int32_t h = surfaceHeight[surfaceId];
+    if (0 >= w || 0 >= h)
+        return false;
+
+    // The caller hands us rows top-down, the same way GLCommon_surfaceGetPixels returns them, while
+    // the texture stores them bottom-up. Flipping here is what makes a round trip through
+    // buffer_get_surface + buffer_set_surface come back the right way up instead of mirrored.
+    int32_t rowBytes = w * 4;
+    uint8_t* tmp = (uint8_t *)safeMalloc((size_t) w * (size_t) h * 4);
+    for (int32_t py = 0; h > py; py++) {
+        memcpy(tmp + (size_t) py * (size_t) rowBytes, rgba + (size_t) (h - 1 - py) * (size_t) rowBytes, (size_t) rowBytes);
+    }
+
+    GLint prevTex = 0;
+    GLint prevUnpackAlign = 4;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex);
+    glGetIntegerv(GL_UNPACK_ALIGNMENT, &prevUnpackAlign);
+
+    glBindTexture(GL_TEXTURE_2D, surfaceTextures[surfaceId]);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, tmp);
+
+    glPixelStorei(GL_UNPACK_ALIGNMENT, prevUnpackAlign);
+    glBindTexture(GL_TEXTURE_2D, (GLuint) prevTex);
+    free(tmp);
+    return true;
+}
+
 #ifndef PLATFORM_PS3
 
 // ===[ GL version queries ]===

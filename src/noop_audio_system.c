@@ -41,6 +41,7 @@ static float noopGetSoundGain(MAYBE_UNUSED AudioSystem* audio, MAYBE_UNUSED int3
 }
 
 static void noopSetSoundPitch(MAYBE_UNUSED AudioSystem* audio, MAYBE_UNUSED int32_t soundOrInstance, MAYBE_UNUSED float pitch) {}
+static void noopSetSoundPan(MAYBE_UNUSED AudioSystem* audio, MAYBE_UNUSED int32_t soundOrInstance, MAYBE_UNUSED float pan) {}
 
 static float noopGetSoundPitch(MAYBE_UNUSED AudioSystem* audio, MAYBE_UNUSED int32_t soundOrInstance) {
     return 1.0f;
@@ -97,6 +98,7 @@ NoopAudioSystem* NoopAudioSystem_create(void) {
     noopVtable.setSoundGain = noopSetSoundGain,
     noopVtable.getSoundGain = noopGetSoundGain,
     noopVtable.setSoundPitch = noopSetSoundPitch,
+    noopVtable.setSoundPan = noopSetSoundPan,
     noopVtable.getSoundPitch = noopGetSoundPitch,
     noopVtable.getTrackPosition = noopGetTrackPosition,
     noopVtable.setTrackPosition = noopSetTrackPosition,

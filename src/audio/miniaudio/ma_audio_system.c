@@ -576,6 +576,24 @@ static void maSetSoundPitch(AudioSystem* audio, int32_t soundOrInstance, float p
     }
 }
 
+static void maSetSoundPan(AudioSystem* audio, int32_t soundOrInstance, float pan) {
+    MaAudioSystem* ma = (MaAudioSystem*) audio;
+
+    if (isValidSoundInstanceId(soundOrInstance)) {
+        SoundInstance* inst = findInstanceById(ma, soundOrInstance);
+        if (inst != nullptr) {
+            ma_sound_set_pan(&inst->maSound, pan);
+        }
+    } else {
+        repeat(MAX_SOUND_INSTANCES, i) {
+            SoundInstance* inst = &ma->instances[i];
+            if (inst->active && inst->soundIndex == soundOrInstance) {
+                ma_sound_set_pan(&inst->maSound, pan);
+            }
+        }
+    }
+}
+
 static float maGetSoundPitch(AudioSystem* audio, int32_t soundOrInstance) {
     MaAudioSystem* ma = (MaAudioSystem*) audio;
 
@@ -862,6 +880,7 @@ MaAudioSystem* MaAudioSystem_create(DataWin* dataWin) {
     maAudioSystemVtable.setSoundGain = maSetSoundGain;
     maAudioSystemVtable.getSoundGain = maGetSoundGain;
     maAudioSystemVtable.setSoundPitch = maSetSoundPitch;
+    maAudioSystemVtable.setSoundPan = maSetSoundPan;
     maAudioSystemVtable.getSoundPitch = maGetSoundPitch;
     maAudioSystemVtable.getTrackPosition = maGetTrackPosition;
     maAudioSystemVtable.setTrackPosition = maSetTrackPosition;

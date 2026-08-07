@@ -6802,6 +6802,163 @@ static RValue builtin_audio_group_get_gain(VMContext* ctx, RValue* args, int32_t
     return RValue_makeReal((GMLReal) audioGroupGain(ctx->runner, RValue_toInt32(args[0])));
 }
 
+// ===[ Audio Emitters ]===
+//
+// Games reach for emitters to place a sound left or right, not to model a room: DELTARUNE parks the
+// listener at the camera centre and slides the emitter along X, and that is the whole effect. So an
+// emitter resolves to two numbers at play time -- a pan and a distance gain -- which is why this
+// lives here rather than in the mixers. Only the pan needs the backend, through setSoundPan.
+
+static AudioEmitter* audioEmitterGet(Runner* runner, int32_t emitterId) {
+    int32_t index = emitterId - 1;   // ids are index + 1 so that 0 stays "no emitter"
+    if (0 > index || (int32_t) arrlen(runner->audioEmitters) <= index) return nullptr;
+    AudioEmitter* emitter = &runner->audioEmitters[index];
+    return emitter->active ? emitter : nullptr;
+}
+
+// GameMaker's inverse-distance-clamped model: full volume up to the reference distance, then
+// falling off, and never quieter than it is at the maximum distance.
+static float audioEmitterDistanceGain(const AudioEmitter* emitter, float distance) {
+    float ref = emitter->falloffRef;
+    float max = emitter->falloffMax;
+    if (0.0f >= ref) return emitter->gain;
+    if (distance < ref) distance = ref;
+    if (max > ref && distance > max) distance = max;
+    float denom = ref + (emitter->falloffFactor * (distance - ref));
+    if (0.0f >= denom) return emitter->gain;
+    return emitter->gain * (ref / denom);
+}
+
+// Pan is the horizontal offset measured against the falloff distance, not the normalised direction
+// a 3D panner would use. Normalising would hard-pan anything even slightly off-centre, which is the
+// opposite of what the callers want: they sweep the emitter along X expecting the sound to travel.
+static float audioEmitterPan(const AudioEmitter* emitter, const Runner* runner) {
+    float span = 0.0f < emitter->falloffMax ? emitter->falloffMax : emitter->falloffRef;
+    if (0.0f >= span) return 0.0f;
+    float pan = (emitter->x - runner->audioListenerX) / span;
+    if (-1.0f > pan) pan = -1.0f;
+    if (1.0f < pan) pan = 1.0f;
+    return pan;
+}
+
+static RValue builtin_audio_emitter_create(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Runner* runner = ctx->runner;
+
+    int32_t index = -1;
+    for (int32_t i = 0; i < (int32_t) arrlen(runner->audioEmitters); i++) {
+        if (!runner->audioEmitters[i].active) { index = i; break; }
+    }
+    if (0 > index) {
+        AudioEmitter blank = {0};
+        arrput(runner->audioEmitters, blank);
+        index = (int32_t) arrlen(runner->audioEmitters) - 1;
+    }
+
+    AudioEmitter* emitter = &runner->audioEmitters[index];
+    emitter->x = emitter->y = emitter->z = 0.0f;
+    emitter->falloffRef = 100.0f;      // GameMaker's defaults
+    emitter->falloffMax = 100000.0f;
+    emitter->falloffFactor = 1.0f;
+    emitter->gain = 1.0f;
+    emitter->active = true;
+    return RValue_makeReal((GMLReal) (index + 1));
+}
+
+static RValue builtin_audio_emitter_free(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (1 > argCount) return RValue_makeUndefined();
+    AudioEmitter* emitter = audioEmitterGet(ctx->runner, RValue_toInt32(args[0]));
+    if (emitter != nullptr) emitter->active = false;
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_audio_emitter_exists(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (1 > argCount) return RValue_makeBool(false);
+    return RValue_makeBool(audioEmitterGet(ctx->runner, RValue_toInt32(args[0])) != nullptr);
+}
+
+static RValue builtin_audio_emitter_position(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (4 > argCount) return RValue_makeUndefined();
+    AudioEmitter* emitter = audioEmitterGet(ctx->runner, RValue_toInt32(args[0]));
+    if (emitter == nullptr) return RValue_makeUndefined();
+    emitter->x = (float) RValue_toReal(args[1]);
+    emitter->y = (float) RValue_toReal(args[2]);
+    emitter->z = (float) RValue_toReal(args[3]);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_audio_emitter_falloff(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (4 > argCount) return RValue_makeUndefined();
+    AudioEmitter* emitter = audioEmitterGet(ctx->runner, RValue_toInt32(args[0]));
+    if (emitter == nullptr) return RValue_makeUndefined();
+    emitter->falloffRef = (float) RValue_toReal(args[1]);
+    emitter->falloffMax = (float) RValue_toReal(args[2]);
+    emitter->falloffFactor = (float) RValue_toReal(args[3]);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_audio_emitter_gain(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (2 > argCount) return RValue_makeUndefined();
+    AudioEmitter* emitter = audioEmitterGet(ctx->runner, RValue_toInt32(args[0]));
+    if (emitter != nullptr) emitter->gain = (float) RValue_toReal(args[1]);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_audio_emitter_get_gain(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (1 > argCount) return RValue_makeReal(1.0);
+    AudioEmitter* emitter = audioEmitterGet(ctx->runner, RValue_toInt32(args[0]));
+    return RValue_makeReal(emitter != nullptr ? (GMLReal) emitter->gain : 1.0);
+}
+
+static RValue builtin_audio_listener_position(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (3 > argCount) return RValue_makeUndefined();
+    ctx->runner->audioListenerX = (float) RValue_toReal(args[0]);
+    ctx->runner->audioListenerY = (float) RValue_toReal(args[1]);
+    ctx->runner->audioListenerZ = (float) RValue_toReal(args[2]);
+    return RValue_makeUndefined();
+}
+
+// audio_play_sound_on(emitter, sound, loop, priority, [gain], [offset], [pitch])
+static RValue builtin_audio_play_sound_on(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (4 > argCount) return RValue_makeReal(-1.0);
+    Runner* runner = ctx->runner;
+    AudioSystem* audio = getAudioSystem(ctx);
+    if (audio == nullptr || args[1].type == RVALUE_UNDEFINED) return RValue_makeReal(-1.0);
+
+    AudioEmitter* emitter = audioEmitterGet(runner, RValue_toInt32(args[0]));
+    int32_t soundIndex = RValue_toInt32(args[1]);
+    bool loop = RValue_toBool(args[2]);
+    int32_t priority = RValue_toInt32(args[3]);
+
+    int32_t instanceId = audio->vtable->playSound(audio, soundIndex, priority, loop);
+    if (0 > instanceId) return RValue_makeReal(-1.0);
+
+    float gain = argCount >= 5 ? (float) RValue_toReal(args[4]) : 1.0f;
+    gain *= audioGroupGainForSound(runner, soundIndex);
+    if (0 <= soundIndex && runner->dataWin->sond.count > (uint32_t) soundIndex) {
+        gain *= runner->dataWin->sond.sounds[soundIndex].volume;
+    }
+
+    if (emitter != nullptr) {
+        float dx = emitter->x - runner->audioListenerX;
+        float dy = emitter->y - runner->audioListenerY;
+        float dz = emitter->z - runner->audioListenerZ;
+        gain *= audioEmitterDistanceGain(emitter, sqrtf((dx * dx) + (dy * dy) + (dz * dz)));
+        // Absent on backends whose mixer is mono -- see the PS2 vtable. Skipping is honest: the
+        // sound still plays at the right volume, it just does not move across the stereo field.
+        if (audio->vtable->setSoundPan != nullptr) {
+            audio->vtable->setSoundPan(audio, instanceId, audioEmitterPan(emitter, runner));
+        }
+    }
+    audio->vtable->setSoundGain(audio, instanceId, gain, 0);
+
+    if (argCount >= 7) audio->vtable->setSoundPitch(audio, instanceId, (float) RValue_toReal(args[6]));
+    if (argCount >= 6) {
+        float offset = (float) RValue_toReal(args[5]);
+        if (0.0f < offset) audio->vtable->setTrackPosition(audio, instanceId, offset);
+    }
+    return RValue_makeReal((GMLReal) instanceId);
+}
+
 static RValue builtin_audio_system_is_available(MAYBE_UNUSED VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
     logSemiStubbedFunction(ctx, "audio_system_is_available");
     return RValue_makeBool(true);
@@ -18658,6 +18815,15 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "audio_set_master_gain", builtin_audio_set_master_gain);
     VM_registerBuiltin(ctx, "audio_group_load", builtin_audio_group_load);
     VM_registerBuiltin(ctx, "audio_group_set_gain", builtin_audio_group_set_gain);
+    VM_registerBuiltin(ctx, "audio_emitter_create", builtin_audio_emitter_create);
+    VM_registerBuiltin(ctx, "audio_emitter_free", builtin_audio_emitter_free);
+    VM_registerBuiltin(ctx, "audio_emitter_exists", builtin_audio_emitter_exists);
+    VM_registerBuiltin(ctx, "audio_emitter_position", builtin_audio_emitter_position);
+    VM_registerBuiltin(ctx, "audio_emitter_falloff", builtin_audio_emitter_falloff);
+    VM_registerBuiltin(ctx, "audio_emitter_gain", builtin_audio_emitter_gain);
+    VM_registerBuiltin(ctx, "audio_emitter_get_gain", builtin_audio_emitter_get_gain);
+    VM_registerBuiltin(ctx, "audio_listener_position", builtin_audio_listener_position);
+    VM_registerBuiltin(ctx, "audio_play_sound_on", builtin_audio_play_sound_on);
     VM_registerBuiltin(ctx, "audio_group_get_gain", builtin_audio_group_get_gain);
     VM_registerBuiltin(ctx, "audio_get_recorder_count", builtin_audio_get_recorder_count);
     VM_registerBuiltin(ctx, "audio_get_recorder_info", builtin_audio_get_recorder_info);

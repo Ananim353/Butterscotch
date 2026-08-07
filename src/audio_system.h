@@ -29,6 +29,11 @@ typedef struct {
     void (*setSoundGain)(AudioSystem* audio, int32_t soundOrInstance, float gain, uint32_t timeMs);
     float (*getSoundGain)(AudioSystem* audio, int32_t soundOrInstance);
     void (*setSoundPitch)(AudioSystem* audio, int32_t soundOrInstance, float pitch);
+    // Stereo placement, -1.0 = full left, 0.0 = centre, +1.0 = full right. Accepts a SOND index
+    // (reaches every live instance of it) or a single instance id, like the gain and pitch setters.
+    // This is what audio emitters are actually used for: games place a listener and an emitter to
+    // pan a sound, not to attenuate it.
+    void (*setSoundPan)(AudioSystem* audio, int32_t soundOrInstance, float pan);
     float (*getSoundPitch)(AudioSystem* audio, int32_t soundOrInstance);
     float (*getTrackPosition)(AudioSystem* audio, int32_t soundOrInstance);
     void (*setTrackPosition)(AudioSystem* audio, int32_t soundOrInstance, float positionSeconds);

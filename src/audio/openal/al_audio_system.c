@@ -779,6 +779,31 @@ static void maSetSoundPitch(AudioSystem* audio, int32_t soundOrInstance, float p
     }
 }
 
+// OpenAL has no pan control, it has a 3D scene. Placing the source on the listener-relative unit
+// circle gives the same result for a mono source: AL_SOURCE_RELATIVE keeps the coordinates in the
+// listener's frame, so x = pan is left/right and the z term keeps the source off the listener's
+// exact position, where OpenAL's panning degenerates.
+static void alSetSourcePan(ALuint source, float pan) {
+    if (-1.0f > pan) pan = -1.0f;
+    if (1.0f < pan) pan = 1.0f;
+    alSourcei(source, AL_SOURCE_RELATIVE, AL_TRUE);
+    alSource3f(source, AL_POSITION, pan, 0.0f, -sqrtf(1.0f - (pan * pan)));
+}
+
+static void maSetSoundPan(AudioSystem* audio, int32_t soundOrInstance, float pan) {
+    AlAudioSystem* ma = (AlAudioSystem*) audio;
+
+    if (soundOrInstance >= SOUND_INSTANCE_ID_BASE) {
+        SoundInstance* inst = findInstanceById(ma, soundOrInstance);
+        if (inst != nullptr) alSetSourcePan(inst->alSource, pan);
+    } else {
+        repeat(MAX_SOUND_INSTANCES, i) {
+            SoundInstance* inst = &ma->instances[i];
+            if (inst->active && inst->soundIndex == soundOrInstance) alSetSourcePan(inst->alSource, pan);
+        }
+    }
+}
+
 static float maGetSoundPitch(AudioSystem* audio, int32_t soundOrInstance) {
     AlAudioSystem* ma = (AlAudioSystem*) audio;
 
@@ -1045,6 +1070,7 @@ AlAudioSystem* AlAudioSystem_create(void) {
     AlAudioSystemVtable.setSoundGain = maSetSoundGain;
     AlAudioSystemVtable.getSoundGain = maGetSoundGain;
     AlAudioSystemVtable.setSoundPitch = maSetSoundPitch;
+    AlAudioSystemVtable.setSoundPan = maSetSoundPan;
     AlAudioSystemVtable.getSoundPitch = maGetSoundPitch;
     AlAudioSystemVtable.getTrackPosition = maGetTrackPosition;
     AlAudioSystemVtable.setTrackPosition = maSetTrackPosition;

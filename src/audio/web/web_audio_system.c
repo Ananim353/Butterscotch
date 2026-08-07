@@ -455,6 +455,21 @@ static void webSetSoundPitch(AudioSystem* audio, int32_t soundOrInstance, float 
     }
 }
 
+static void webSetSoundPan(AudioSystem* audio, int32_t soundOrInstance, float pan) {
+    WebAudioSystem* ma = (WebAudioSystem*) audio;
+    if (!ma->engineReady) return;
+
+    if (soundOrInstance >= WEB_SOUND_INSTANCE_ID_BASE) {
+        WebSoundInstance* inst = findInstanceById(ma, soundOrInstance);
+        if (inst != nullptr) ma_sound_set_pan(&inst->maSound, pan);
+    } else {
+        repeat(WEB_MAX_SOUND_INSTANCES, i) {
+            WebSoundInstance* inst = &ma->instances[i];
+            if (inst->active && inst->soundIndex == soundOrInstance) ma_sound_set_pan(&inst->maSound, pan);
+        }
+    }
+}
+
 static float webGetSoundPitch(AudioSystem* audio, int32_t soundOrInstance) {
     WebAudioSystem* ma = (WebAudioSystem*) audio;
     if (!ma->engineReady) return 1.0f;
@@ -710,6 +725,7 @@ WebAudioSystem* WebAudioSystem_create(DataWin* dataWin, int32_t sampleRate) {
     webAudioSystemVtable.setSoundGain = webSetSoundGain;
     webAudioSystemVtable.getSoundGain = webGetSoundGain;
     webAudioSystemVtable.setSoundPitch = webSetSoundPitch;
+    webAudioSystemVtable.setSoundPan = webSetSoundPan;
     webAudioSystemVtable.getSoundPitch = webGetSoundPitch;
     webAudioSystemVtable.getTrackPosition = webGetTrackPosition;
     webAudioSystemVtable.setTrackPosition = webSetTrackPosition;

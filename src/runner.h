@@ -290,6 +290,18 @@ typedef struct {
     RValue item;
 } DsPriorityItem;
 
+// An audio emitter: a point the game moves around to place a sound relative to the listener.
+// Defaults match GameMaker's, so an emitter that is created and never configured is silent-neutral
+// rather than silent.
+typedef struct {
+    float x, y, z;
+    float falloffRef;      // distance at which the sound is at full volume
+    float falloffMax;      // distance beyond which it does not get any quieter
+    float falloffFactor;   // how sharply it drops between the two
+    float gain;
+    bool active;
+} AudioEmitter;
+
 // One callback queued by call_later. Delays are kept in frames: seconds are converted at the call
 // site, so the tick stays a plain subtraction and does not care which unit was asked for.
 typedef struct {
@@ -569,6 +581,13 @@ struct Runner {
     // audio_group_set_gain: per-group multiplier, indexed by AGRP group. Grown on demand; a group
     // that was never set reads as 1.0 rather than needing the array to cover it.
     float* audioGroupGains;   // stb_ds array
+
+    // Audio emitters. Slots are reused after audio_emitter_free, so an id is index + 1 and 0 means
+    // "no emitter" -- the same shape GML's -1/0 checks expect.
+    AudioEmitter* audioEmitters;   // stb_ds array
+    float audioListenerX;
+    float audioListenerY;
+    float audioListenerZ;
 
     // call_later: callbacks waiting to fire, ticked once per frame from Runner_step.
     // GML's wider time_source_* tree is deliberately not modelled -- games reach for call_later on

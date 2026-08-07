@@ -1341,6 +1341,10 @@ Ps2AudioSystem* Ps2AudioSystem_create(void) {
     ps2AudioSystemVtable.setSoundGain = ps2SetSoundGain;
     ps2AudioSystemVtable.getSoundGain = ps2GetSoundGain;
     ps2AudioSystemVtable.setSoundPitch = ps2SetSoundPitch;
+    // setSoundPan is deliberately left null here. The PS2 mixer sums every voice into one mono
+    // accumulator and duplicates it to both channels, so panning would mean splitting that hot
+    // per-sample loop into left and right -- a real cost on this hardware for one effect. The
+    // emitter builtins skip panning when the hook is absent rather than pretending it worked.
     ps2AudioSystemVtable.getSoundPitch = ps2GetSoundPitch;
     ps2AudioSystemVtable.getTrackPosition = ps2GetTrackPosition;
     ps2AudioSystemVtable.setTrackPosition = ps2SetTrackPosition;

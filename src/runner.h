@@ -290,6 +290,35 @@ typedef struct {
     RValue item;
 } DsPriorityItem;
 
+// vertex_format_* / vertex_buffer_*: the attributes a format declares, in the order the game
+// declared them. Vertices are written attribute by attribute, so the order is what tells
+// vertex_position from vertex_colour when both are just numbers arriving in sequence.
+typedef enum {
+    VertexAttr_Position2D = 0,
+    VertexAttr_Position3D,
+    VertexAttr_Colour,
+    VertexAttr_Normal,
+    VertexAttr_TexCoord,
+} VertexAttrKind;
+
+#define VERTEX_FORMAT_MAX_ATTRS 8
+
+typedef struct {
+    VertexAttrKind attrs[VERTEX_FORMAT_MAX_ATTRS];
+    int32_t attrCount;
+    bool active;
+} VertexFormat;
+
+typedef struct {
+    PrimitiveVertex* verts;   // stb_ds array of completed vertices
+    PrimitiveVertex partial;  // the one being filled in right now
+    int32_t attrCursor;       // how many of the format's attributes the partial vertex has
+    float normalX, normalY, normalZ;   // last normal written; see the projective note in vm_builtins
+    int32_t formatId;
+    bool active;
+    bool building;            // between vertex_begin and vertex_end
+} VertexBuffer;
+
 // An audio emitter: a point the game moves around to place a sound relative to the listener.
 // Defaults match GameMaker's, so an emitter that is created and never configured is silent-neutral
 // rather than silent.
@@ -581,6 +610,11 @@ struct Runner {
     // audio_group_set_gain: per-group multiplier, indexed by AGRP group. Grown on demand; a group
     // that was never set reads as 1.0 rather than needing the array to cover it.
     float* audioGroupGains;   // stb_ds array
+
+    // Vertex formats and buffers. Ids are index + 1 for both, so 0 stays "none".
+    VertexFormat* vertexFormats;   // stb_ds array
+    VertexBuffer* vertexBuffers;   // stb_ds array
+    VertexFormat vertexFormatUnderConstruction;   // between vertex_format_begin and vertex_format_end
 
     // Audio emitters. Slots are reused after audio_emitter_free, so an id is index + 1 and 0 means
     // "no emitter" -- the same shape GML's -1/0 checks expect.

@@ -2374,6 +2374,14 @@ static void cleanupState(Runner* runner) {
     arrfree(runner->audioEmitters);
     runner->audioEmitters = nullptr;
 
+    repeat((int32_t) arrlen(runner->vertexBuffers), i) {
+        arrfree(runner->vertexBuffers[i].verts);
+    }
+    arrfree(runner->vertexBuffers);
+    runner->vertexBuffers = nullptr;
+    arrfree(runner->vertexFormats);
+    runner->vertexFormats = nullptr;
+
     {
     repeat((int32_t) arrlen(runner->dsQueuePool), i) {
         DsQueue* q = &runner->dsQueuePool[i];

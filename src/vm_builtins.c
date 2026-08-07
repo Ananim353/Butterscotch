@@ -6802,6 +6802,275 @@ static RValue builtin_audio_group_get_gain(VMContext* ctx, RValue* args, int32_t
     return RValue_makeReal((GMLReal) audioGroupGain(ctx->runner, RValue_toInt32(args[0])));
 }
 
+// Defined with the primitive builder further down; vertex_submit decomposes into the same two.
+static void primEmitTriangle(Renderer* renderer, const PrimitiveVertex* a, const PrimitiveVertex* b, const PrimitiveVertex* c);
+static void primEmitLine(Renderer* renderer, const PrimitiveVertex* a, const PrimitiveVertex* b);
+
+// ===[ Vertex Formats and Buffers ]===
+//
+// A buffer collects finished PrimitiveVertex values, so vertex_submit hands them to the same
+// drawPrimitiveTriangle path draw_primitive_end uses. Only the front end differs: instead of one
+// call per vertex, the game declares a format and then writes attributes in that order, and a
+// vertex is complete once it has received all of them.
+
+static VertexFormat* vertexFormatGet(Runner* runner, int32_t formatId) {
+    int32_t index = formatId - 1;
+    if (0 > index || (int32_t) arrlen(runner->vertexFormats) <= index) return nullptr;
+    VertexFormat* format = &runner->vertexFormats[index];
+    return format->active ? format : nullptr;
+}
+
+static VertexBuffer* vertexBufferGet(Runner* runner, int32_t bufferId) {
+    int32_t index = bufferId - 1;
+    if (0 > index || (int32_t) arrlen(runner->vertexBuffers) <= index) return nullptr;
+    VertexBuffer* buffer = &runner->vertexBuffers[index];
+    return buffer->active ? buffer : nullptr;
+}
+
+static void vertexFormatAddAttr(Runner* runner, VertexAttrKind kind) {
+    VertexFormat* format = &runner->vertexFormatUnderConstruction;
+    if (VERTEX_FORMAT_MAX_ATTRS <= format->attrCount) {
+        logWarn("VM: vertex format has more than %d attributes; ignoring the rest\n", VERTEX_FORMAT_MAX_ATTRS);
+        return;
+    }
+    format->attrs[format->attrCount++] = kind;
+}
+
+// Advances past one attribute and, once the format is satisfied, commits the vertex.
+static void vertexAttrWritten(Runner* runner, VertexBuffer* buffer) {
+    VertexFormat* format = vertexFormatGet(runner, buffer->formatId);
+    int32_t attrCount = format != nullptr ? format->attrCount : 0;
+    buffer->attrCursor++;
+    if (0 >= attrCount || buffer->attrCursor < attrCount) return;
+
+    // A format with a normal but no texcoord is the projective-quad trick: the game stuffs
+    // (u*q, v*q, q) into the normal and lets a shader divide it back out. We do the divide here,
+    // which recovers the right UV at every corner. The interpolation between them stays affine --
+    // matching it exactly needs the shader path, not the vertex path.
+    if (format != nullptr) {
+        bool hasNormal = false, hasTexCoord = false;
+        for (int32_t i = 0; i < attrCount; i++) {
+            if (format->attrs[i] == VertexAttr_Normal) hasNormal = true;
+            if (format->attrs[i] == VertexAttr_TexCoord) hasTexCoord = true;
+        }
+        if (hasNormal && !hasTexCoord && buffer->normalZ != 0.0f) {
+            buffer->partial.u = buffer->normalX / buffer->normalZ;
+            buffer->partial.v = buffer->normalY / buffer->normalZ;
+        }
+    }
+
+    arrput(buffer->verts, buffer->partial);
+    buffer->attrCursor = 0;
+    buffer->partial.u = 0.0f;
+    buffer->partial.v = 0.0f;
+}
+
+static RValue builtin_vertex_format_begin(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    ctx->runner->vertexFormatUnderConstruction.attrCount = 0;
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_vertex_format_add_position(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    vertexFormatAddAttr(ctx->runner, VertexAttr_Position2D);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_vertex_format_add_position_3d(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    vertexFormatAddAttr(ctx->runner, VertexAttr_Position3D);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_vertex_format_add_colour(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    vertexFormatAddAttr(ctx->runner, VertexAttr_Colour);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_vertex_format_add_normal(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    vertexFormatAddAttr(ctx->runner, VertexAttr_Normal);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_vertex_format_add_texcoord(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    vertexFormatAddAttr(ctx->runner, VertexAttr_TexCoord);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_vertex_format_end(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Runner* runner = ctx->runner;
+    VertexFormat format = runner->vertexFormatUnderConstruction;
+    format.active = true;
+
+    int32_t index = -1;
+    for (int32_t i = 0; i < (int32_t) arrlen(runner->vertexFormats); i++) {
+        if (!runner->vertexFormats[i].active) { index = i; break; }
+    }
+    if (0 > index) {
+        arrput(runner->vertexFormats, format);
+        index = (int32_t) arrlen(runner->vertexFormats) - 1;
+    } else {
+        runner->vertexFormats[index] = format;
+    }
+    runner->vertexFormatUnderConstruction.attrCount = 0;
+    return RValue_makeReal((GMLReal) (index + 1));
+}
+
+static RValue builtin_vertex_create_buffer(VMContext* ctx, MAYBE_UNUSED RValue* args, MAYBE_UNUSED int32_t argCount) {
+    Runner* runner = ctx->runner;
+
+    int32_t index = -1;
+    for (int32_t i = 0; i < (int32_t) arrlen(runner->vertexBuffers); i++) {
+        if (!runner->vertexBuffers[i].active) { index = i; break; }
+    }
+    if (0 > index) {
+        VertexBuffer blank = {0};
+        arrput(runner->vertexBuffers, blank);
+        index = (int32_t) arrlen(runner->vertexBuffers) - 1;
+    }
+
+    VertexBuffer* buffer = &runner->vertexBuffers[index];
+    arrsetlen(buffer->verts, 0);   // a reused slot keeps its allocation, not its contents
+    buffer->attrCursor = 0;
+    buffer->formatId = 0;
+    buffer->building = false;
+    buffer->active = true;
+    return RValue_makeReal((GMLReal) (index + 1));
+}
+
+static RValue builtin_vertex_delete_buffer(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (1 > argCount) return RValue_makeUndefined();
+    VertexBuffer* buffer = vertexBufferGet(ctx->runner, RValue_toInt32(args[0]));
+    if (buffer == nullptr) return RValue_makeUndefined();
+    arrfree(buffer->verts);
+    buffer->verts = nullptr;
+    buffer->active = false;
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_vertex_begin(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (2 > argCount) return RValue_makeUndefined();
+    VertexBuffer* buffer = vertexBufferGet(ctx->runner, RValue_toInt32(args[0]));
+    if (buffer == nullptr) return RValue_makeUndefined();
+    arrsetlen(buffer->verts, 0);
+    buffer->formatId = RValue_toInt32(args[1]);
+    buffer->attrCursor = 0;
+    buffer->building = true;
+    PrimitiveVertex blank = {0};
+    blank.color = 0xFFFFFFu;
+    blank.alpha = 1.0f;
+    buffer->partial = blank;
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_vertex_end(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (1 > argCount) return RValue_makeUndefined();
+    VertexBuffer* buffer = vertexBufferGet(ctx->runner, RValue_toInt32(args[0]));
+    if (buffer != nullptr) buffer->building = false;
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_vertex_position(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (3 > argCount) return RValue_makeUndefined();
+    VertexBuffer* buffer = vertexBufferGet(ctx->runner, RValue_toInt32(args[0]));
+    if (buffer == nullptr || !buffer->building) return RValue_makeUndefined();
+    buffer->partial.x = (float) RValue_toReal(args[1]);
+    buffer->partial.y = (float) RValue_toReal(args[2]);
+    vertexAttrWritten(ctx->runner, buffer);
+    return RValue_makeUndefined();
+}
+
+// The z of a 3D position is dropped: everything downstream of here draws in 2D screen space.
+static RValue builtin_vertex_position_3d(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (4 > argCount) return RValue_makeUndefined();
+    VertexBuffer* buffer = vertexBufferGet(ctx->runner, RValue_toInt32(args[0]));
+    if (buffer == nullptr || !buffer->building) return RValue_makeUndefined();
+    buffer->partial.x = (float) RValue_toReal(args[1]);
+    buffer->partial.y = (float) RValue_toReal(args[2]);
+    vertexAttrWritten(ctx->runner, buffer);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_vertex_colour(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (3 > argCount) return RValue_makeUndefined();
+    VertexBuffer* buffer = vertexBufferGet(ctx->runner, RValue_toInt32(args[0]));
+    if (buffer == nullptr || !buffer->building) return RValue_makeUndefined();
+    buffer->partial.color = (uint32_t) RValue_toInt32(args[1]);
+    buffer->partial.alpha = (float) RValue_toReal(args[2]);
+    vertexAttrWritten(ctx->runner, buffer);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_vertex_normal(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (4 > argCount) return RValue_makeUndefined();
+    VertexBuffer* buffer = vertexBufferGet(ctx->runner, RValue_toInt32(args[0]));
+    if (buffer == nullptr || !buffer->building) return RValue_makeUndefined();
+    buffer->normalX = (float) RValue_toReal(args[1]);
+    buffer->normalY = (float) RValue_toReal(args[2]);
+    buffer->normalZ = (float) RValue_toReal(args[3]);
+    vertexAttrWritten(ctx->runner, buffer);
+    return RValue_makeUndefined();
+}
+
+static RValue builtin_vertex_texcoord(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (3 > argCount) return RValue_makeUndefined();
+    VertexBuffer* buffer = vertexBufferGet(ctx->runner, RValue_toInt32(args[0]));
+    if (buffer == nullptr || !buffer->building) return RValue_makeUndefined();
+    buffer->partial.u = (float) RValue_toReal(args[1]);
+    buffer->partial.v = (float) RValue_toReal(args[2]);
+    vertexAttrWritten(ctx->runner, buffer);
+    return RValue_makeUndefined();
+}
+
+// vertex_submit(buffer, primitiveKind, texture)
+static RValue builtin_vertex_submit(VMContext* ctx, RValue* args, int32_t argCount) {
+    if (2 > argCount) return RValue_makeUndefined();
+    Runner* runner = ctx->runner;
+    Renderer* renderer = runner->renderer;
+    VertexBuffer* buffer = vertexBufferGet(runner, RValue_toInt32(args[0]));
+    if (buffer == nullptr || renderer == nullptr) return RValue_makeUndefined();
+
+    int32_t kind = RValue_toInt32(args[1]);
+    int32_t texHandle = argCount >= 3 ? RValue_toInt32(args[2]) : -1;
+
+    // vertex_submit carries its texture per call, unlike the builder's begin/end pair, so the
+    // renderer's primitive texture is borrowed for the duration and put back afterwards.
+    uint32_t savedTexture = renderer->primTexture;
+    renderer->primTexture = 0 < texHandle ? (uint32_t) texHandle : 0;
+
+    const PrimitiveVertex* verts = buffer->verts;
+    int32_t count = (int32_t) arrlen(buffer->verts);
+    switch (kind) {
+        case pr_pointlist:
+            for (int32_t i = 0; i < count; i++) {
+                renderer->vtable->drawRectangle(renderer, verts[i].x, verts[i].y, verts[i].x, verts[i].y,
+                                                verts[i].color, verts[i].alpha, false);
+            }
+            break;
+        case pr_linelist:
+            for (int32_t i = 0; i + 1 < count; i += 2) primEmitLine(renderer, &verts[i], &verts[i + 1]);
+            break;
+        case pr_linestrip:
+            for (int32_t i = 0; i + 1 < count; i++) primEmitLine(renderer, &verts[i], &verts[i + 1]);
+            break;
+        case pr_trianglelist:
+            for (int32_t i = 0; i + 2 < count; i += 3) primEmitTriangle(renderer, &verts[i], &verts[i + 1], &verts[i + 2]);
+            break;
+        case pr_trianglestrip:
+            for (int32_t i = 0; i + 2 < count; i++) {
+                if ((i & 1) == 0) primEmitTriangle(renderer, &verts[i], &verts[i + 1], &verts[i + 2]);
+                else primEmitTriangle(renderer, &verts[i + 1], &verts[i], &verts[i + 2]);
+            }
+            break;
+        case pr_trianglefan:
+            for (int32_t i = 1; i + 1 < count; i++) primEmitTriangle(renderer, &verts[0], &verts[i], &verts[i + 1]);
+            break;
+        default:
+            break;
+    }
+
+    renderer->primTexture = savedTexture;
+    return RValue_makeUndefined();
+}
+
 // ===[ Audio Emitters ]===
 //
 // Games reach for emitters to place a sound left or right, not to model a room: DELTARUNE parks the
@@ -18816,6 +19085,27 @@ void VMBuiltins_registerAll(VMContext* ctx) {
     VM_registerBuiltin(ctx, "audio_group_load", builtin_audio_group_load);
     VM_registerBuiltin(ctx, "audio_group_set_gain", builtin_audio_group_set_gain);
     VM_registerBuiltin(ctx, "audio_emitter_create", builtin_audio_emitter_create);
+    VM_registerBuiltin(ctx, "vertex_format_begin", builtin_vertex_format_begin);
+    VM_registerBuiltin(ctx, "vertex_format_end", builtin_vertex_format_end);
+    VM_registerBuiltin(ctx, "vertex_format_add_position", builtin_vertex_format_add_position);
+    VM_registerBuiltin(ctx, "vertex_format_add_position_3d", builtin_vertex_format_add_position_3d);
+    VM_registerBuiltin(ctx, "vertex_format_add_colour", builtin_vertex_format_add_colour);
+    VM_registerBuiltin(ctx, "vertex_format_add_color", builtin_vertex_format_add_colour);
+    VM_registerBuiltin(ctx, "vertex_format_add_normal", builtin_vertex_format_add_normal);
+    VM_registerBuiltin(ctx, "vertex_format_add_texcoord", builtin_vertex_format_add_texcoord);
+    // Not a typo on our side: GameMaker ships this misspelling as a real alias, and Chapter 2 calls it.
+    VM_registerBuiltin(ctx, "vertex_format_add_textcoord", builtin_vertex_format_add_texcoord);
+    VM_registerBuiltin(ctx, "vertex_create_buffer", builtin_vertex_create_buffer);
+    VM_registerBuiltin(ctx, "vertex_delete_buffer", builtin_vertex_delete_buffer);
+    VM_registerBuiltin(ctx, "vertex_begin", builtin_vertex_begin);
+    VM_registerBuiltin(ctx, "vertex_end", builtin_vertex_end);
+    VM_registerBuiltin(ctx, "vertex_submit", builtin_vertex_submit);
+    VM_registerBuiltin(ctx, "vertex_position", builtin_vertex_position);
+    VM_registerBuiltin(ctx, "vertex_position_3d", builtin_vertex_position_3d);
+    VM_registerBuiltin(ctx, "vertex_colour", builtin_vertex_colour);
+    VM_registerBuiltin(ctx, "vertex_color", builtin_vertex_colour);
+    VM_registerBuiltin(ctx, "vertex_normal", builtin_vertex_normal);
+    VM_registerBuiltin(ctx, "vertex_texcoord", builtin_vertex_texcoord);
     VM_registerBuiltin(ctx, "audio_emitter_free", builtin_audio_emitter_free);
     VM_registerBuiltin(ctx, "audio_emitter_exists", builtin_audio_emitter_exists);
     VM_registerBuiltin(ctx, "audio_emitter_position", builtin_audio_emitter_position);
